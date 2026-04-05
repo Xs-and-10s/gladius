@@ -419,6 +419,57 @@ defmodule Inspex do
     %Cond{predicate_fn: predicate_fn, if_spec: if_spec, else_spec: else_spec || any()}
   end
 
+  @doc """
+  Wraps a spec with a coercion — a transformation applied to the value
+  **before** type-checking and constraints run.
+
+  ## Forms
+
+      # Custom coercion function — returns {:ok, coerced} or {:error, reason}
+      coerce(integer(), fn
+        v when is_binary(v) ->
+          case Integer.parse(String.trim(v)) do
+            {n, ""} -> {:ok, n}
+            _       -> {:error, "not an integer string: \#{inspect(v)}"}
+          end
+        v when is_integer(v) -> {:ok, v}
+        v -> {:error, "cannot coerce \#{inspect(v)} to integer"}
+      end)
+
+      # Built-in shorthand — coerce from a source type
+      coerce(integer(), from: :string)   # "42"    → 42
+      coerce(float(),   from: :string)   # "3.14"  → 3.14
+      coerce(boolean(), from: :string)   # "true"  → true, "yes" → true, "1" → true
+      coerce(atom(),    from: :string)   # "ok"    → :ok  (existing atoms only)
+
+  ## Coercion runs before validation
+
+  The pipeline is: `raw → coerce → type_check → constraints → {:ok, coerced}`.
+  If coercion fails, an `%Inspex.Error{predicate: :coerce}` is returned and
+  downstream checks are skipped.
+
+  ## Idempotency
+
+  Built-in coercions pass values that are already the target type through
+  unchanged. `coerce(integer(), from: :string)` accepts both `"42"` and `42`.
+
+  ## Composing with maybe/1
+
+      maybe(coerce(integer(), from: :string))
+      # nil passes; "42" → 42; 42 → 42; "bad" → error
+  """
+  @spec coerce(Spec.t(), (term() -> {:ok, term()} | {:error, term()})) :: Spec.t()
+  @spec coerce(Spec.t(), [{:from, atom()}]) :: Spec.t()
+  def coerce(%Spec{} = spec, coerce_fn) when is_function(coerce_fn, 1) do
+    %{spec | coercion: coerce_fn}
+  end
+
+  def coerce(%Spec{type: target_type} = spec, from: source_type)
+      when is_atom(source_type) do
+    coerce_fn = Inspex.Coercions.lookup(source_type, target_type)
+    %{spec | coercion: coerce_fn}
+  end
+
   # ===========================================================================
   # Schema builders
   # ===========================================================================
@@ -486,6 +537,24 @@ defmodule Inspex do
   @spec conform(conformable(), term()) :: conform_result()
 
   # --- Spec (leaf) -----------------------------------------------------------
+
+  # Coercion pre-processing — must be first among all %Spec{} clauses.
+  # Strips the coercion, applies it, then recurses with a clean spec.
+  # Every downstream clause continues to work without modification.
+  def conform(%Spec{coercion: coerce_fn} = spec, value) when not is_nil(coerce_fn) do
+    case coerce_fn.(value) do
+      {:ok, coerced}  ->
+        conform(%{spec | coercion: nil}, coerced)
+
+      {:error, reason} ->
+        {:error, [%Error{
+          predicate: :coerce,
+          value: value,
+          message: to_string(reason),
+          meta: %{original: value}
+        }]}
+    end
+  end
 
   # `any()` — unconditional pass
   def conform(%Spec{type: :any}, value), do: {:ok, value}
