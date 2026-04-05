@@ -112,17 +112,19 @@ defmodule Inspex do
   conforming, but the typed form carries named constraint metadata that the
   generator can use without a manual hint.
   """
-  defmacro spec(expr, _opts \\ []) do
-    source = Macro.to_string(expr)
-    # We rewrite the spec expression into a boolean body using a known var,
-    # then wrap it once in `fn __v__ -> body end`.
-    # This avoids nested lambdas and keeps the compiled function clean.
-    v = Macro.var(:__inspex_v__, __MODULE__)
+  defmacro spec(expr, opts \\ []) do
+    source  = Macro.to_string(expr)
+    v       = Macro.var(:__inspex_v__, __MODULE__)
     bool_body = to_bool_expr(expr, v)
+    # opts[:gen] is nil when absent, or the AST of the StreamData generator
+    # expression. unquote(nil) stores nil; unquote(gen_ast) splices the
+    # expression so it is evaluated at runtime and stored in the struct field.
+    gen_ast = opts[:gen]
 
     quote do
       %Inspex.Spec{
         predicate: fn unquote(v) -> unquote(bool_body) end,
+        generator: unquote(gen_ast),
         meta: %{source: unquote(source)}
       }
     end
@@ -522,8 +524,44 @@ defmodule Inspex do
   end
 
   # ===========================================================================
-  # The conform interpreter — a recursive, pattern-matched tree walk
+  # gen/1 — generator inference (Step 4)
   # ===========================================================================
+
+  @doc """
+  Returns a `StreamData` generator for `spec`.
+
+  Typed specs with named constraints are inferred automatically. Predicate-only
+  specs require an explicit `:gen` override on `spec/2`.
+
+  ## Usage
+
+      use ExUnitProperties
+      import Inspex
+
+      property "generated users always conform" do
+        user = schema(%{
+          required(:name) => string(:filled?),
+          required(:age)  => integer(gte?: 18, lte?: 120),
+          optional(:role) => atom(in?: [:admin, :user])
+        })
+        check all value <- Inspex.gen(user) do
+          assert Inspex.valid?(user, value)
+        end
+      end
+
+  ## Explicit generator override
+
+  For predicate-only specs, supply a generator via the `:gen` option:
+
+      even_int = spec(fn x -> is_integer(x) and rem(x, 2) == 0 end,
+                      gen: StreamData.integer() |> StreamData.filter(&(rem(&1, 2) == 0)))
+
+      Inspex.gen(even_int)  # uses the explicit generator, no error
+
+  See `Inspex.Gen` for the full inference rule table.
+  """
+  @spec gen(conformable()) :: StreamData.t()
+  defdelegate gen(spec), to: Inspex.Gen
 
   @doc """
   Validates `value` against `spec`.

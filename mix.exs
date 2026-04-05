@@ -4,7 +4,7 @@ defmodule Inspex.MixProject do
   def project do
     [
       app: :inspex,
-      version: "0.2.0-dev",
+      version: "0.3.0-dev",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -21,7 +21,7 @@ defmodule Inspex.MixProject do
 
   defp deps do
     [
-      # Step 4: {:stream_data, "~> 1.1", only: [:dev, :test]}
+      {:stream_data, "~> 1.1"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
