@@ -5,24 +5,15 @@ defmodule Gladius.Default do
 
   ## Semantics
 
-  - **Key absent** from the parent `schema/1` or `open_schema/1` map: the
-    fallback `value` is injected directly into the output *without* running
-    the inner spec. The value is assumed correct — validating it on every
-    call would be redundant and would break the common pattern of using a
-    compile-time literal that you know is valid.
-
+  - **Key absent**: the fallback `value` is injected directly — inner spec
+    not run. The value is assumed correct.
   - **Key present**: the inner `spec` is run against the provided value
-    normally. The fallback is ignored. An invalid provided value returns an
-    error — the default does **not** rescue it.
-
+    normally. An invalid provided value returns an error; the default does
+    not rescue it.
   - **Required key**: a `default/2` on a required key has no effect on
-    absence behaviour. Required keys that are absent always produce a
-    missing-key error. The `default/2` wrapper is still meaningful for type
-    documentation purposes.
+    absence behaviour.
 
   ## Usage
-
-      import Gladius
 
       schema(%{
         required(:name) => string(:filled?),
@@ -34,10 +25,11 @@ defmodule Gladius.Default do
   """
 
   @enforce_keys [:spec, :value]
-  defstruct [:spec, :value]
+  defstruct [:spec, :value, :message]
 
   @type t :: %__MODULE__{
-          spec: Gladius.conformable(),
-          value: term()
+          spec:    Gladius.conformable(),
+          value:   term(),
+          message: Gladius.Spec.message()
         }
 end

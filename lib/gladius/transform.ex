@@ -4,15 +4,12 @@ defmodule Gladius.Transform do
 
   ## Semantics
 
-  The pipeline is: `raw → conform(inner_spec) → fun.(shaped) → {:ok, result}`.
-
-  - **Validation fails** → `{:error, errors}` is returned immediately; `fun` is
-    never called. A transform never rescues invalid data.
-  - **Validation passes** → `fun.(shaped_value)` is called. Its return value
+  - **Validation fails** → `{:error, errors}` returned immediately; `fun`
+    never called.
+  - **Validation passes** → `fun.(shaped_value)` called. Its return value
     becomes the final `:ok` result.
-  - **`fun` raises** → the exception is caught and surfaced as a
-    `%Gladius.Error{predicate: :transform}`. The caller gets
-    `{:error, [%Gladius.Error{message: "transform failed: ..."}]}`.
+  - **`fun` raises** → exception caught and surfaced as
+    `%Gladius.Error{predicate: :transform}`.
 
   ## Usage
 
@@ -21,27 +18,18 @@ defmodule Gladius.Transform do
       email_spec = transform(string(:filled?, format: ~r/@/), &String.downcase/1)
       name_spec  = transform(string(:filled?), &String.trim/1)
 
-      schema(%{
-        required(:email) => email_spec,
-        required(:name)  => name_spec
-      })
+      # With custom message
+      transform(string(:filled?), &String.trim/1, message: "name could not be normalised")
 
-  `transform/2` accepts any conformable as its inner spec:
-
-      # Transform on a schema
-      transform(schema(%{required(:x) => integer()}), fn m -> Map.put(m, :y, m.x * 2) end)
-
-      # Chained — trim then downcase
-      transform(transform(string(:filled?), &String.trim/1), &String.downcase/1)
-
-  See `Gladius.transform/2` for construction.
+  See `Gladius.transform/2-3` for construction.
   """
 
   @enforce_keys [:spec, :fun]
-  defstruct [:spec, :fun]
+  defstruct [:spec, :fun, :message]
 
   @type t :: %__MODULE__{
-          spec: Gladius.conformable(),
-          fun: (term() -> term())
+          spec:    Gladius.conformable(),
+          fun:     (term() -> term()),
+          message: Gladius.Spec.message()
         }
 end

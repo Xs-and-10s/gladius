@@ -114,10 +114,13 @@ defmodule Gladius do
     bool_body = to_bool_expr(expr, v)
     gen_ast = opts[:gen]
 
+    msg_ast = opts[:message]
+
     quote do
       %Gladius.Spec{
         predicate: fn unquote(v) -> unquote(bool_body) end,
         generator: unquote(gen_ast),
+        message:   unquote(msg_ast),
         meta: %{source: unquote(source)}
       }
     end
@@ -341,6 +344,13 @@ defmodule Gladius do
     [{shorthand, true} | more]
   end
 
+  # Pulls :message out of a constraint keyword list so it doesn't reach
+  # Gladius.Constraints.check/2, which would silently ignore it but leave
+  # it polluting the constraints list in introspection.
+  defp split_message(cs) when is_list(cs) do
+    {cs[:message], Keyword.delete(cs, :message)}
+  end
+
   @doc """
   A string spec, with optional named constraints.
 
@@ -354,9 +364,12 @@ defmodule Gladius do
   @spec string(atom() | keyword()) :: Spec.t()
   @spec string(atom(), keyword()) :: Spec.t()
   def string(constraints \\ [])
-  def string(c) when is_atom(c),                 do: string([{c, true}])
-  def string(cs) when is_list(cs),               do: %Spec{type: :string, constraints: cs}
-  def string(c, more) when is_atom(c),           do: string(merge_constraints(c, more))
+  def string(c) when is_atom(c),        do: string([{c, true}])
+  def string(cs) when is_list(cs) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :string, constraints: constraints, message: msg}
+  end
+  def string(c, more) when is_atom(c),   do: string(merge_constraints(c, more))
 
   @doc """
   An integer spec, with optional named constraints.
@@ -369,25 +382,36 @@ defmodule Gladius do
   @spec integer(atom() | keyword()) :: Spec.t()
   @spec integer(atom(), keyword()) :: Spec.t()
   def integer(constraints \\ [])
-  def integer(c) when is_atom(c),                do: integer([{c, true}])
-  def integer(cs) when is_list(cs),              do: %Spec{type: :integer, constraints: cs}
-  def integer(c, more) when is_atom(c),          do: integer(merge_constraints(c, more))
+  def integer(c) when is_atom(c),       do: integer([{c, true}])
+  def integer(cs) when is_list(cs) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :integer, constraints: constraints, message: msg}
+  end
+  def integer(c, more) when is_atom(c),  do: integer(merge_constraints(c, more))
 
   @doc "A float spec, with optional named constraints."
   @spec float(atom() | keyword()) :: Spec.t()
   @spec float(atom(), keyword()) :: Spec.t()
   def float(constraints \\ [])
-  def float(c) when is_atom(c),                  do: float([{c, true}])
-  def float(cs) when is_list(cs),                do: %Spec{type: :float, constraints: cs}
-  def float(c, more) when is_atom(c),            do: float(merge_constraints(c, more))
+  def float(c) when is_atom(c),         do: float([{c, true}])
+  def float(cs) when is_list(cs) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :float, constraints: constraints, message: msg}
+  end
+  def float(c, more) when is_atom(c),    do: float(merge_constraints(c, more))
 
   @doc "Accepts integers or floats, with optional named constraints."
   @spec number(keyword()) :: Spec.t()
-  def number(constraints \\ []),                 do: %Spec{type: :number, constraints: constraints}
+  def number(cs \\ []) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :number, constraints: constraints, message: msg}
+  end
 
   @doc "A boolean spec. No meaningful constraints apply."
   @spec boolean() :: Spec.t()
-  def boolean,                                   do: %Spec{type: :boolean}
+  def boolean(opts \\ [])
+  def boolean([]),                        do: %Spec{type: :boolean}
+  def boolean(message: msg),              do: %Spec{type: :boolean, message: msg}
 
   @doc """
   An atom spec, with optional named constraints.
@@ -396,11 +420,16 @@ defmodule Gladius do
       atom(in?: [:admin, :user])
   """
   @spec atom(keyword()) :: Spec.t()
-  def atom(constraints \\ []),                   do: %Spec{type: :atom, constraints: constraints}
+  def atom(cs \\ []) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :atom, constraints: constraints, message: msg}
+  end
 
   @doc "Accepts any map. For shape validation, use `schema/1`."
   @spec map() :: Spec.t()
-  def map,                                       do: %Spec{type: :map}
+  def map(opts \\ [])
+  def map([]),                            do: %Spec{type: :map}
+  def map(message: msg),                  do: %Spec{type: :map, message: msg}
 
   @doc """
   Accepts any list. For typed lists (all elements checked), use `list_of/1`.
@@ -412,13 +441,18 @@ defmodule Gladius do
   @spec list(atom() | keyword()) :: Spec.t()
   @spec list(atom(), keyword()) :: Spec.t()
   def list(constraints \\ [])
-  def list(c) when is_atom(c),                   do: list([{c, true}])
-  def list(cs) when is_list(cs),                 do: %Spec{type: :list, constraints: cs}
-  def list(c, more) when is_atom(c),             do: list(merge_constraints(c, more))
+  def list(c) when is_atom(c),          do: list([{c, true}])
+  def list(cs) when is_list(cs) do
+    {msg, constraints} = split_message(cs)
+    %Spec{type: :list, constraints: constraints, message: msg}
+  end
+  def list(c, more) when is_atom(c),     do: list(merge_constraints(c, more))
 
   @doc "Accepts any value unconditionally. Useful as an `else` branch or placeholder."
   @spec any() :: Spec.t()
-  def any,                                       do: %Spec{type: :any}
+  def any(opts \\ [])
+  def any([]),                            do: %Spec{type: :any}
+  def any(message: msg),                  do: %Spec{type: :any, message: msg}
 
   @doc "Accepts only `nil`."
   @spec nil_spec() :: Spec.t()
@@ -455,7 +489,10 @@ defmodule Gladius do
   against `inner_spec`.
   """
   @spec maybe(conformable()) :: Maybe.t()
-  def maybe(inner_spec), do: %Maybe{spec: inner_spec}
+  @spec maybe(conformable(), [{:message, Spec.message()}]) :: Maybe.t()
+  def maybe(inner_spec, opts \\ [])
+  def maybe(inner_spec, []),              do: %Maybe{spec: inner_spec}
+  def maybe(inner_spec, message: msg),   do: %Maybe{spec: inner_spec, message: msg}
 
   @doc """
   Lazy reference to a named spec in `Gladius.Registry`.
@@ -516,10 +553,11 @@ defmodule Gladius do
     %{spec | coercion: coerce_fn}
   end
 
-  def coerce(%Spec{type: target_type} = spec, from: source_type)
-      when is_atom(source_type) do
-    coerce_fn = Gladius.Coercions.lookup(source_type, target_type)
-    %{spec | coercion: coerce_fn}
+  def coerce(%Spec{type: target_type} = spec, opts) when is_list(opts) do
+    source_type = Keyword.fetch!(opts, :from)
+    message     = opts[:message]
+    coerce_fn   = Gladius.Coercions.lookup(source_type, target_type)
+    %{spec | coercion: coerce_fn, message: message || spec.message}
   end
 
   @doc """
@@ -557,7 +595,10 @@ defmodule Gladius do
   `raw → coerce → validate → transform → {:ok, result}`
   """
   @spec transform(conformable(), (term() -> term())) :: Transform.t()
-  def transform(spec, fun) when is_function(fun, 1), do: %Transform{spec: spec, fun: fun}
+  @spec transform(conformable(), (term() -> term()), [{:message, Spec.message()}]) :: Transform.t()
+  def transform(spec, fun, opts \\ []) when is_function(fun, 1) do
+    %Transform{spec: spec, fun: fun, message: opts[:message]}
+  end
 
   @doc """
   Wraps a spec with a fallback value injected when an optional schema key
@@ -593,7 +634,10 @@ defmodule Gladius do
       optional(:ref)    => default(maybe(string(:filled?)), nil)
   """
   @spec default(conformable(), term()) :: Default.t()
-  def default(spec, value), do: %Default{spec: spec, value: value}
+  @spec default(conformable(), term(), [{:message, Spec.message()}]) :: Default.t()
+  def default(spec, value, opts \\ []) do
+    %Default{spec: spec, value: value, message: opts[:message]}
+  end
 
   # ===========================================================================
   # Schema builders
@@ -687,6 +731,40 @@ defmodule Gladius do
   """
   @spec conform(conformable(), term()) :: conform_result()
 
+  # --- Message override wrappers ----------------------------------------------
+  #
+  # When a conformable carries a non-nil :message, strip it, run the real
+  # clause, then replace all error messages with the custom one.
+  # These must be first so they fire before any other clause for their type.
+
+  def conform(%Spec{message: msg} = spec, value) when not is_nil(msg) do
+    conform(%{spec | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Transform{message: msg} = t, value) when not is_nil(msg) do
+    conform(%{t | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Maybe{message: msg} = m, value) when not is_nil(msg) do
+    conform(%{m | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Any{message: msg} = a, value) when not is_nil(msg) do
+    conform(%{a | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Not{message: msg} = n, value) when not is_nil(msg) do
+    conform(%{n | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Default{message: msg} = d, value) when not is_nil(msg) do
+    conform(%{d | message: nil}, value) |> override_message(msg)
+  end
+
+  def conform(%Schema{message: msg} = s, value) when not is_nil(msg) do
+    conform(%{s | message: nil}, value) |> override_message(msg)
+  end
+
   # --- Struct input (transparent conversion) ----------------------------------
   #
   # Any Elixir struct is converted to a plain map before dispatch.
@@ -717,10 +795,14 @@ defmodule Gladius do
           {:ok, fun.(shaped)}
         rescue
           e ->
+            reason   = Exception.message(e)
+            bindings = [reason: reason]
             {:error, [%Error{
-              predicate: :transform,
-              value: shaped,
-              message: "transform failed: #{Exception.message(e)}"
+              predicate:        :transform,
+              value:            shaped,
+              message:          translate_default("transform failed: " <> reason, :transform, bindings),
+              message_key:      :transform,
+              message_bindings: bindings
             }]}
         end
     end
@@ -735,11 +817,15 @@ defmodule Gladius do
         conform(%{spec | coercion: nil}, coerced)
 
       {:error, reason} ->
+        default_msg = to_string(reason)
+        bindings    = [original: value]
         {:error, [%Error{
-          predicate: :coerce,
-          value: value,
-          message: to_string(reason),
-          meta: %{original: value}
+          predicate:        :coerce,
+          value:            value,
+          message:          translate_default(default_msg, :coerce, bindings),
+          message_key:      :coerce,
+          message_bindings: bindings,
+          meta:             %{original: value}
         }]}
     end
   end
@@ -1101,12 +1187,16 @@ defmodule Gladius do
     {:error, type_error(type, value, "must be a #{type}, got: #{inspect(type_of(value))}")}
   end
 
-  defp type_error(type, value, message) do
+  defp type_error(type, value, default_message) do
+    bindings = [expected: type, actual: type_of(value)]
+    message  = translate_default(default_message, :type?, bindings)
     %Error{
-      predicate: :type?,
-      value: value,
-      message: message,
-      meta: %{expected_type: type, actual_type: type_of(value)}
+      predicate:        :type?,
+      value:            value,
+      message:          message,
+      message_key:      :type?,
+      message_bindings: bindings,
+      meta:             %{expected_type: type, actual_type: type_of(value)}
     }
   end
 
@@ -1125,4 +1215,38 @@ defmodule Gladius do
   defp type_of(v) when is_pid(v),      do: :pid
   defp type_of(nil),                   do: :nil
   defp type_of(_),                     do: :unknown
+
+  # ---------------------------------------------------------------------------
+  # Message override helpers
+  # ---------------------------------------------------------------------------
+
+  # Replaces the :message field on all errors in an error result.
+  # {:ok, _} passes through unchanged.
+  defp override_message({:ok, _} = ok, _msg), do: ok
+  defp override_message({:error, errors}, msg) do
+    resolved = resolve_message(msg)
+    {:error, Enum.map(errors, &%{&1 | message: resolved})}
+  end
+
+  # Resolves a message value to a final string:
+  #   nil                       — should not be called (guard in callers)
+  #   binary                    — returned as-is; assumed already localised
+  #   {domain, msgid, bindings} — passed through translator if configured;
+  #                               falls back to msgid when no translator set
+  defp resolve_message(msg) when is_binary(msg), do: msg
+  defp resolve_message({domain, msgid, bindings}) do
+    case Application.get_env(:gladius, :translator) do
+      nil -> msgid
+      mod -> mod.translate(domain, msgid, bindings)
+    end
+  end
+
+  # Used by built-in error constructors (type_error, coerce, transform).
+  # Applies the translator when configured; returns default_message otherwise.
+  defp translate_default(default_message, _key, bindings) do
+    case Application.get_env(:gladius, :translator) do
+      nil -> default_message
+      mod -> mod.translate(nil, default_message, bindings)
+    end
+  end
 end
