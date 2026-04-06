@@ -159,9 +159,42 @@ defmodule Inspex do
   - `defschema` is for **composite schemas** — generates callable functions in
     the current module and is the ergonomic entry point for validation.
   """
-  defmacro defspec(name, spec) when is_atom(name) do
+  defmacro defspec(name, spec, opts \\ []) when is_atom(name) do
+    type_code = defspec_type_code(name, spec, opts, __CALLER__)
     quote do
       Inspex.Registry.register(unquote(name), unquote(spec))
+      unquote(type_code)
+    end
+  end
+
+  # Builds the @type declaration AST when `type: true` is passed.
+  #
+  # Uses Code.eval_quoted to run the spec expression in the caller's
+  # environment — __CALLER__ carries import Inspex so spec builders resolve.
+  # Emits IO.warn (a compile-time warning pointing at the defspec call site)
+  # for each lossiness notice. Falls back to a no-op if the spec expression
+  # can't be evaluated at compile time (e.g. it references a runtime variable).
+  defp defspec_type_code(name, spec_ast, opts, caller) do
+    if Keyword.get(opts, :type, false) do
+      try do
+        {spec_struct, _bindings} = Code.eval_quoted(spec_ast, [], caller)
+
+        for {_reason, msg} <- Inspex.Typespec.lossiness(spec_struct) do
+          IO.warn("defspec #{inspect(name)} type: #{msg}", caller)
+        end
+
+        Inspex.Typespec.type_ast(name, spec_struct)
+      rescue
+        err ->
+          IO.warn(
+            "defspec #{inspect(name)}: could not evaluate spec at compile time; " <>
+              "@type skipped. Cause: #{Exception.message(err)}",
+            caller
+          )
+          quote do: :ok
+      end
+    else
+      quote do: :ok
     end
   end
 
@@ -220,8 +253,23 @@ defmodule Inspex do
       defschema :address, do: address_schema()
       # Then: Inspex.def(:address, address_schema())
   """
-  defmacro defschema(name, do: schema_expr) when is_atom(name) do
-    bang = :"#{name}!"
+  # Accepts two call forms:
+  #   defschema :user do ... end
+  #   defschema :user, type: true do ... end
+  #
+  # When opts include `type: true`, also injects a @type declaration for the
+  # schema struct type. Uses the same Code.eval_quoted approach as defspec.
+  defmacro defschema(name, opts_or_block, block \\ nil) when is_atom(name) do
+    {opts, schema_expr} =
+      case {opts_or_block, block} do
+        # defschema :user do ... end
+        {[do: expr], nil}       -> {[], expr}
+        # defschema :user, type: true do ... end
+        {opts, [do: expr]}      -> {opts, expr}
+      end
+
+    bang      = :"#{name}!"
+    type_code = defschema_type_code(name, schema_expr, opts, __CALLER__)
 
     quote do
       @doc "Validates `data` against the `#{unquote(name)}` schema. Returns `{:ok, value}` or `{:error, errors}`."
@@ -236,6 +284,32 @@ defmodule Inspex do
           {:error, errors} -> raise Inspex.ConformError, name: unquote(name), errors: errors
         end
       end
+
+      unquote(type_code)
+    end
+  end
+
+  defp defschema_type_code(name, schema_ast, opts, caller) do
+    if Keyword.get(opts, :type, false) do
+      try do
+        {schema_struct, _} = Code.eval_quoted(schema_ast, [], caller)
+
+        for {_reason, msg} <- Inspex.Typespec.lossiness(schema_struct) do
+          IO.warn("defschema #{inspect(name)} type: #{msg}", caller)
+        end
+
+        Inspex.Typespec.type_ast(name, schema_struct)
+      rescue
+        err ->
+          IO.warn(
+            "defschema #{inspect(name)}: could not evaluate schema at compile time; " <>
+              "@type skipped. Cause: #{Exception.message(err)}",
+            caller
+          )
+          quote do: :ok
+      end
+    else
+      quote do: :ok
     end
   end
 
@@ -536,7 +610,11 @@ defmodule Inspex do
   ## Usage
 
       use ExUnitProperties
-      import Inspex
+      import Inspex, except: [integer: 0, integer: 1, integer: 2,
+                               float: 0, float: 1, float: 2,
+                               string: 0, string: 1, string: 2,
+                               boolean: 0, atom: 0, atom: 1,
+                               list: 0, list: 1, list: 2, list_of: 1]
 
       property "generated users always conform" do
         user = schema(%{
@@ -554,13 +632,17 @@ defmodule Inspex do
   For predicate-only specs, supply a generator via the `:gen` option:
 
       even_int = spec(fn x -> is_integer(x) and rem(x, 2) == 0 end,
-                      gen: StreamData.integer() |> StreamData.filter(&(rem(&1, 2) == 0)))
+                      gen: StreamData.filter(StreamData.integer(), &(rem(&1, 2) == 0)))
 
       Inspex.gen(even_int)  # uses the explicit generator, no error
 
   See `Inspex.Gen` for the full inference rule table.
+
+  > #### Availability {: .info}
+  > `gen/1` requires `stream_data` to be available. Add it to your deps
+  > with `only: [:dev, :test]` since it is a development and testing aid,
+  > not a production concern.
   """
-  @spec gen(conformable()) :: StreamData.t()
   defdelegate gen(spec), to: Inspex.Gen
 
   @doc """
@@ -881,6 +963,29 @@ defmodule Inspex do
     }
   end
 
+
+  # ===========================================================================
+  # Typespec conversion (Step 5 bridge to Elixir's type system)
+  # ===========================================================================
+
+  @doc """
+  Converts an inspex spec to quoted Elixir typespec AST.
+
+  Returns a valid `Macro.t()` in all cases. Constructs with no typespec
+  equivalent fall back to `term()` or their base type. Use
+  `typespec_lossiness/1` to see what was elided.
+
+      iex> import Inspex
+      iex> Macro.to_string(Inspex.to_typespec(integer(gte?: 0)))
+      "non_neg_integer()"
+  """
+  defdelegate to_typespec(spec), to: Inspex.Typespec
+
+  @doc """
+  Returns lossiness notices for a spec — `[{reason, description}]`.
+  Empty list means lossless. See `Inspex.Typespec` for full docs.
+  """
+  defdelegate typespec_lossiness(spec), to: Inspex.Typespec, as: :lossiness
   defp prepend_path(errors, key) do
     Enum.map(errors, fn err -> %{err | path: [key | err.path]} end)
   end

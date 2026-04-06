@@ -122,8 +122,8 @@ defmodule Inspex.Signature do
 
   defp generate_wrapper(name, arity, opts_ast) do
     impl    = impl_name(name, arity)
-    splat   = for i <- 0..(arity - 1), arity > 0, do: Macro.var(:"__ia#{i}__", nil)
-    coerced = for i <- 0..(arity - 1), arity > 0, do: Macro.var(:"__ca#{i}__", nil)
+    splat   = for i <- 0..(max(arity - 1, 0)), arity > 0, do: Macro.var(:"ia#{i}__", nil)
+    coerced = for i <- 0..(max(arity - 1, 0)), arity > 0, do: Macro.var(:"ca#{i}__", nil)
 
     quote do
       Kernel.def unquote(name)(unquote_splicing(splat)) do

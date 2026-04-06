@@ -260,8 +260,157 @@ defmodule Inspex.CoercionTest do
 
   describe "unknown built-in coercion" do
     test "raises ArgumentError for unsupported source type" do
-      assert_raise ArgumentError, ~r/No built-in coercion/, fn ->
+      assert_raise ArgumentError, ~r/No coercion/, fn ->
         coerce(integer(), from: :json)
+      end
+    end
+  end
+  # ===========================================================================
+  # from: :integer built-ins
+  # ===========================================================================
+
+  describe "coerce(spec, from: :integer) — float" do
+    setup do: {:ok, spec: coerce(float(), from: :integer)}
+
+    test "coerces integer to float", %{spec: spec} do
+      assert {:ok, 42.0} = conform(spec, 42)
+      assert {:ok, result} = conform(spec, 0)
+      assert result == 0.0
+      assert {:ok, -7.0} = conform(spec, -7)
+    end
+
+    test "passes float through unchanged", %{spec: spec} do
+      assert {:ok, 3.14} = conform(spec, 3.14)
+    end
+
+    test "fails on non-integer, non-float", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, "42")
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, nil)
+    end
+  end
+
+  describe "coerce(spec, from: :integer) — string" do
+    setup do: {:ok, spec: coerce(string(), from: :integer)}
+
+    test "coerces integer to string", %{spec: spec} do
+      assert {:ok, "42"}  = conform(spec, 42)
+      assert {:ok, "0"}   = conform(spec, 0)
+      assert {:ok, "-7"}  = conform(spec, -7)
+    end
+
+    test "passes string through unchanged", %{spec: spec} do
+      assert {:ok, "hello"} = conform(spec, "hello")
+    end
+
+    test "fails on non-integer, non-string", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, 3.14)
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, :atom)
+    end
+  end
+
+  describe "coerce(spec, from: :integer) — boolean" do
+    setup do: {:ok, spec: coerce(boolean(), from: :integer)}
+
+    test "0 → false, 1 → true", %{spec: spec} do
+      assert {:ok, false} = conform(spec, 0)
+      assert {:ok, true}  = conform(spec, 1)
+    end
+
+    test "passes booleans through", %{spec: spec} do
+      assert {:ok, true}  = conform(spec, true)
+      assert {:ok, false} = conform(spec, false)
+    end
+
+    test "fails on integers other than 0 and 1", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, 2)
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, -1)
+    end
+
+    test "fails on non-integer, non-boolean", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, "true")
+    end
+  end
+
+  # ===========================================================================
+  # from: :atom built-ins
+  # ===========================================================================
+
+  describe "coerce(spec, from: :atom) — string" do
+    setup do: {:ok, spec: coerce(string(), from: :atom)}
+
+    test "coerces atom to string", %{spec: spec} do
+      assert {:ok, "ok"}    = conform(spec, :ok)
+      assert {:ok, "error"} = conform(spec, :error)
+      assert {:ok, "admin"} = conform(spec, :admin)
+    end
+
+    test "passes string through unchanged", %{spec: spec} do
+      assert {:ok, "hello"} = conform(spec, "hello")
+    end
+
+    test "fails on non-atom, non-string", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, 42)
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, nil)
+    end
+  end
+
+  # ===========================================================================
+  # from: :float built-ins
+  # ===========================================================================
+
+  describe "coerce(spec, from: :float) — integer" do
+    setup do: {:ok, spec: coerce(integer(), from: :float)}
+
+    test "truncates float toward zero", %{spec: spec} do
+      assert {:ok, 3}  = conform(spec, 3.7)
+      assert {:ok, 3}  = conform(spec, 3.0)
+      assert {:ok, -3} = conform(spec, -3.7)
+    end
+
+    test "passes integer through unchanged", %{spec: spec} do
+      assert {:ok, 42} = conform(spec, 42)
+    end
+
+    test "fails on non-float, non-integer", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, "3.7")
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, nil)
+    end
+  end
+
+  describe "coerce(spec, from: :float) — string" do
+    setup do: {:ok, spec: coerce(string(), from: :float)}
+
+    test "coerces float to string", %{spec: spec} do
+      assert {:ok, "3.14"} = conform(spec, 3.14)
+      assert {:ok, "0.0"}  = conform(spec, 0.0)
+    end
+
+    test "passes string through unchanged", %{spec: spec} do
+      assert {:ok, "hello"} = conform(spec, "hello")
+    end
+
+    test "fails on non-float, non-string", %{spec: spec} do
+      assert {:error, [%{predicate: :coerce}]} = conform(spec, 42)
+    end
+  end
+
+  # ===========================================================================
+  # Unknown built-in — updated error message
+  # ===========================================================================
+
+  describe "unknown built-in — updated error message" do
+    test "lists all built-in sources in the error" do
+      assert_raise ArgumentError, fn ->
+        coerce(integer(), from: :json)
+      end
+    end
+
+    test "suggests register/2 in the error message" do
+      try do
+        coerce(integer(), from: :decimal)
+      rescue
+        e in ArgumentError ->
+          assert Exception.message(e) =~ "register"
       end
     end
   end

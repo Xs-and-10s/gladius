@@ -214,7 +214,7 @@ defmodule Inspex.Typespec do
   @spec type_ast(atom(), Inspex.conformable()) :: Macro.t()
   def type_ast(name, spec) when is_atom(name) do
     ts = to_typespec(spec)
-    {:@, [], [{:type, [], [{:::, [], [{name, [], []}, ts]}]}]}
+    {:@, [], [{:type, [], [{:":::", [], [{name, [], []}, ts]}]}]}
   end
 
   # ===========================================================================
