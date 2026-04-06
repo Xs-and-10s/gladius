@@ -7,6 +7,119 @@ Gladius adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.0] — Unreleased
+
+### Added
+
+#### Default values — `default/2`
+
+New combinator that injects a fallback when an optional schema key is absent.
+The fallback is injected as-is — the inner spec only runs when the key is present.
+
+```elixir
+schema(%{
+  required(:name)    => string(:filled?),
+  optional(:role)    => default(atom(in?: [:admin, :user]), :user),
+  optional(:retries) => default(integer(gte?: 0), 3)
+})
+```
+
+- Absent key → fallback injected; inner spec not run
+- Present key → inner spec validates the provided value normally
+- Invalid provided value → error returned; fallback does not rescue it
+- Required key → `default/2` has no effect on absence
+- Composes with `ref/1` — a ref pointing to a `%Default{}` resolves correctly
+
+#### Post-validation transforms — `transform/2`
+
+New combinator that applies a function to the shaped value after validation
+succeeds. Never runs on invalid data. Exceptions from the transform function
+are caught and surfaced as `%Gladius.Error{predicate: :transform}`.
+
+```elixir
+schema(%{
+  required(:name)  => transform(string(:filled?), &String.trim/1),
+  required(:email) => transform(string(:filled?, format: ~r/@/), &String.downcase/1)
+})
+
+# Chainable via pipe — transform/2 is spec-first:
+string(:filled?)
+|> transform(&String.trim/1)
+|> transform(&String.downcase/1)
+```
+
+- Runs after coercion and validation: `raw → coerce → validate → transform → {:ok, result}`
+- Absent optional keys with `default(transform(...), val)` bypass the transform
+- `gen/1` and `to_typespec/1` delegate to the inner spec
+
+#### Struct validation
+
+`conform/2` now accepts any Elixir struct as input. The struct is converted
+to a plain map via `Map.from_struct/1` before dispatch. Output is a plain map.
+
+```elixir
+Gladius.conform(schema, %User{name: "Mark", email: "mark@x.com"})
+#=> {:ok, %{name: "Mark", email: "mark@x.com"}}
+```
+
+`conform_struct/2` validates a struct and re-wraps the shaped output in the
+original struct type on success.
+
+```elixir
+Gladius.conform_struct(schema, %User{name: "  Mark  ", age: "33"})
+#=> {:ok, %User{name: "Mark", age: 33}}
+```
+
+`defschema` now accepts a `struct: true` option that defines both the
+validator functions and a matching output struct in a single declaration.
+The struct module is named `<CallerModule>.<PascalName>Schema`.
+
+```elixir
+defmodule MyApp.Schemas do
+  import Gladius
+
+  defschema :point, struct: true do
+    schema(%{required(:x) => integer(), required(:y) => integer()})
+  end
+end
+
+MyApp.Schemas.point(%{x: 3, y: 4})
+#=> {:ok, %MyApp.Schemas.PointSchema{x: 3, y: 4}}
+```
+
+#### Ecto integration — `Gladius.Ecto`
+
+New optional module `Gladius.Ecto` (guarded by
+`Code.ensure_loaded?(Ecto.Changeset)`) that converts a Gladius schema into an
+`Ecto.Changeset`. Requires `{:ecto, "~> 3.0"}` in the consuming application's
+dependencies — Gladius does not pull it in transitively.
+
+```elixir
+# Schemaless (create workflows)
+Gladius.Ecto.changeset(gladius_schema, params)
+
+# Schema-aware (update workflows)
+Gladius.Ecto.changeset(gladius_schema, params, %User{})
+```
+
+- String-keyed params (the Phoenix default) are normalised to atom keys
+  before conforming — no manual atomisation step needed
+- On `{:ok, shaped}` — changeset is valid; `changes` contains the fully
+  shaped output with coercions, transforms, and defaults applied
+- On `{:error, errors}` — changeset is invalid; each `%Gladius.Error{}` is
+  mapped to `add_error/3` keyed on the last path segment
+  (`%Error{path: [:address, :zip]}` → `add_error(cs, :zip, ...)`)
+- Returns a plain `%Ecto.Changeset{}` — pipe Ecto validators after as normal
+
+### Changed
+
+- `conformable()` type union extended with `Gladius.Default` and
+  `Gladius.Transform`
+- `Gladius.Gen.gen/1` and `Gladius.Typespec.to_typespec/1` now handle
+  `%Default{}` and `%Transform{}` by delegating to their inner spec
+
+---
+
 ## [0.1.0] — unreleased
 
 First public release.
@@ -83,4 +196,5 @@ First public release.
 
 ---
 
+[0.2.0]: https://github.com/Xs-and-10s/gladius/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Xs-and-10s/gladius/releases/tag/v0.1.0

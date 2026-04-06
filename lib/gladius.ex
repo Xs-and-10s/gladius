@@ -45,7 +45,7 @@ defmodule Gladius do
 
   alias Gladius.{
     Spec, All, Any, Not, Maybe, Ref, ListOf, Cond, Schema, SchemaKey,
-    Error, ExplainResult, Constraints
+    Default, Transform, Error, ExplainResult, Constraints
   }
 
   # ---------------------------------------------------------------------------
@@ -62,6 +62,8 @@ defmodule Gladius do
           | ListOf.t()
           | Cond.t()
           | Schema.t()
+          | Default.t()
+          | Transform.t()
 
   @type conform_result :: {:ok, term()} | {:error, [Error.t()]}
 
@@ -110,9 +112,6 @@ defmodule Gladius do
     source  = Macro.to_string(expr)
     v       = Macro.var(:__gladius_v__, __MODULE__)
     bool_body = to_bool_expr(expr, v)
-    # opts[:gen] is nil when absent, or the AST of the StreamData generator
-    # expression. unquote(nil) stores nil; unquote(gen_ast) splices the
-    # expression so it is evaluated at runtime and stored in the struct field.
     gen_ast = opts[:gen]
 
     quote do
@@ -125,7 +124,7 @@ defmodule Gladius do
   end
 
   # ===========================================================================
-  # Gladius.def/2 — global spec registration (Clojure s/def equivalent)
+  # defspec — global spec registration (Clojure s/def equivalent)
   # ===========================================================================
 
   @doc """
@@ -161,13 +160,6 @@ defmodule Gladius do
     end
   end
 
-  # Builds the @type declaration AST when `type: true` is passed.
-  #
-  # Uses Code.eval_quoted to run the spec expression in the caller's
-  # environment — __CALLER__ carries import Gladius so spec builders resolve.
-  # Emits IO.warn (a compile-time warning pointing at the defspec call site)
-  # for each lossiness notice. Falls back to a no-op if the spec expression
-  # can't be evaluated at compile time (e.g. it references a runtime variable).
   defp defspec_type_code(name, spec_ast, opts, caller) do
     if Keyword.get(opts, :type, false) do
       try do
@@ -225,61 +217,72 @@ defmodule Gladius do
 
   - `name/1`  — returns `{:ok, shaped_value}` or `{:error, [%Gladius.Error{}]}`
   - `name!/1` — returns `shaped_value` or raises `Gladius.ConformError`
-
-  ## Registering a defschema globally
-
-  `defschema` does not automatically register the schema in the `Gladius.Registry`.
-  If you want to reference it via `ref/1`, call `Gladius.def/2` separately:
-
-      defschema :address do
-        schema(%{required(:street) => string(:filled?), required(:zip) => string(size?: 5)})
-      end
-
-      # Now ref(:address) works from other schemas
-      Gladius.def(:address, address(%{}))   # ← call your own function to get the schema struct
-
-  A cleaner approach: define the schema expression once as a module function:
-
-      def address_schema do
-        schema(%{required(:street) => string(:filled?), required(:zip) => string(size?: 5)})
-      end
-
-      defschema :address, do: address_schema()
-      # Then: Gladius.def(:address, address_schema())
   """
-  # Accepts two call forms:
-  #   defschema :user do ... end
-  #   defschema :user, type: true do ... end
-  #
-  # When opts include `type: true`, also injects a @type declaration for the
-  # schema struct type. Uses the same Code.eval_quoted approach as defspec.
   defmacro defschema(name, opts_or_block, block \\ nil) when is_atom(name) do
     {opts, schema_expr} =
       case {opts_or_block, block} do
-        # defschema :user do ... end
         {[do: expr], nil}       -> {[], expr}
-        # defschema :user, type: true do ... end
         {opts, [do: expr]}      -> {opts, expr}
       end
 
-    bang      = :"#{name}!"
-    type_code = defschema_type_code(name, schema_expr, opts, __CALLER__)
-
-    quote do
-      @doc "Validates `data` against the `#{unquote(name)}` schema. Returns `{:ok, value}` or `{:error, errors}`."
-      def unquote(name)(data) do
-        Gladius.conform(unquote(schema_expr), data)
+    bang        = :"#{name}!"
+    type_code   = defschema_type_code(name, schema_expr, opts, __CALLER__)
+    struct_mode = Keyword.get(opts, :struct, false)
+    # When struct: true, the generated struct module is named <CallerModule>.<PascalName>Schema
+    # e.g. defschema :point in MyApp.Schemas → MyApp.Schemas.PointSchema
+    struct_mod  =
+      if struct_mode do
+        caller_mod = __CALLER__.module
+        pascal     = name |> Atom.to_string() |> Macro.camelize()
+        Module.concat(caller_mod, :"#{pascal}Schema")
       end
 
-      @doc "Like `#{unquote(name)}/1` but returns the shaped value or raises `Gladius.ConformError`."
-      def unquote(bang)(data) do
-        case unquote(name)(data) do
-          {:ok, value}     -> value
-          {:error, errors} -> raise Gladius.ConformError, name: unquote(name), errors: errors
+    if struct_mode do
+      quote do
+        # Define the output struct — fields are inferred at compile time by
+        # evaluating the schema expression and extracting key names.
+        defmodule unquote(struct_mod) do
+          @moduledoc false
+          schema_struct = unquote(schema_expr)
+          fields = Enum.map(schema_struct.keys, & &1.name)
+          defstruct fields
         end
-      end
 
-      unquote(type_code)
+        @doc "Validates `data` against the `#{unquote(name)}` schema. Returns `{:ok, %#{unquote(struct_mod)}{}}` or `{:error, errors}`."
+        def unquote(name)(data) do
+          case Gladius.conform(unquote(schema_expr), data) do
+            {:ok, shaped} -> {:ok, struct(unquote(struct_mod), shaped)}
+            err           -> err
+          end
+        end
+
+        @doc "Like `#{unquote(name)}/1` but returns the struct or raises `Gladius.ConformError`."
+        def unquote(bang)(data) do
+          case unquote(name)(data) do
+            {:ok, value}     -> value
+            {:error, errors} -> raise Gladius.ConformError, name: unquote(name), errors: errors
+          end
+        end
+
+        unquote(type_code)
+      end
+    else
+      quote do
+        @doc "Validates `data` against the `#{unquote(name)}` schema. Returns `{:ok, value}` or `{:error, errors}`."
+        def unquote(name)(data) do
+          Gladius.conform(unquote(schema_expr), data)
+        end
+
+        @doc "Like `#{unquote(name)}/1` but returns the shaped value or raises `Gladius.ConformError`."
+        def unquote(bang)(data) do
+          case unquote(name)(data) do
+            {:ok, value}     -> value
+            {:error, errors} -> raise Gladius.ConformError, name: unquote(name), errors: errors
+          end
+        end
+
+        unquote(type_code)
+      end
     end
   end
 
@@ -307,33 +310,25 @@ defmodule Gladius do
     end
   end
 
-  # `expr and expr` — recursively inline both sides
   defp to_bool_expr({:and, _, [left, right]}, v) do
     l = to_bool_expr(left, v)
     r = to_bool_expr(right, v)
     quote do unquote(l) and unquote(r) end
   end
 
-  # `is_integer()` (zero-arg guard call) — rewrite to `is_integer(v)`
   defp to_bool_expr({guard_fn, meta, args}, v)
        when guard_fn in @guard_fns and args in [[], nil] do
     {guard_fn, meta, [v]}
   end
 
-  # `&is_integer/1` or `&(&1 > 0)` — use apply/2 rather than capture.()
-  # to avoid Elixir's nested-capture restriction when two & expressions
-  # appear in the same `and` chain.
   defp to_bool_expr({:&, _, _} = capture, v) do
     quote do apply(unquote(capture), [unquote(v)]) end
   end
 
-  # `fn x -> ... end` — same apply/2 treatment for consistency
   defp to_bool_expr({:fn, _, _} = fn_literal, v) do
     quote do apply(unquote(fn_literal), [unquote(v)]) end
   end
 
-  # Anything else: treat as a value that responds to apply/2
-  # (e.g. a local variable holding a function reference)
   defp to_bool_expr(other, v) do
     quote do apply(unquote(other), [unquote(v)]) end
   end
@@ -342,9 +337,6 @@ defmodule Gladius do
   # Primitive type builders
   # ===========================================================================
 
-  # Shared helper: normalise `(atom, keyword)` into a flat constraint list.
-  # Enables the ergonomic `string(:filled?, format: ~r/@/, min_length: 3)` form
-  # in addition to the existing `string(:filled?)` and `string(filled?: true, ...)` forms.
   defp merge_constraints(shorthand, more) when is_atom(shorthand) and is_list(more) do
     [{shorthand, true} | more]
   end
@@ -517,16 +509,6 @@ defmodule Gladius do
   The pipeline is: `raw → coerce → type_check → constraints → {:ok, coerced}`.
   If coercion fails, an `%Gladius.Error{predicate: :coerce}` is returned and
   downstream checks are skipped.
-
-  ## Idempotency
-
-  Built-in coercions pass values that are already the target type through
-  unchanged. `coerce(integer(), from: :string)` accepts both `"42"` and `42`.
-
-  ## Composing with maybe/1
-
-      maybe(coerce(integer(), from: :string))
-      # nil passes; "42" → 42; 42 → 42; "bad" → error
   """
   @spec coerce(Spec.t(), (term() -> {:ok, term()} | {:error, term()})) :: Spec.t()
   @spec coerce(Spec.t(), [{:from, atom()}]) :: Spec.t()
@@ -539,6 +521,79 @@ defmodule Gladius do
     coerce_fn = Gladius.Coercions.lookup(source_type, target_type)
     %{spec | coercion: coerce_fn}
   end
+
+  @doc """
+  Wraps a spec with a post-validation transformation function.
+
+  `fun/1` is called with the *shaped* value only after the inner spec
+  succeeds. It is never called when validation fails.
+
+  ## Examples
+
+      # Normalize strings at the boundary
+      transform(string(:filled?, format: ~r/@/), &String.downcase/1)
+      transform(string(:filled?), &String.trim/1)
+
+      # Enrich a schema output
+      transform(
+        schema(%{required(:name) => string(:filled?)}),
+        fn m -> Map.put(m, :slug, String.downcase(m.name)) end
+      )
+
+      # Chain transforms with pipe
+      string(:filled?)
+      |> transform(&String.trim/1)
+      |> transform(&String.downcase/1)
+
+  ## Error handling
+
+  If `fun` raises, the exception is caught and returned as
+  `{:error, [%Gladius.Error{predicate: :transform, ...}]}`. The transform
+  never crashes the caller.
+
+  ## Ordering with coerce/2
+
+  Coercion runs **before** validation; transform runs **after**:
+  `raw → coerce → validate → transform → {:ok, result}`
+  """
+  @spec transform(conformable(), (term() -> term())) :: Transform.t()
+  def transform(spec, fun) when is_function(fun, 1), do: %Transform{spec: spec, fun: fun}
+
+  @doc """
+  Wraps a spec with a fallback value injected when an optional schema key
+  is absent.
+
+  The inner `spec` constrains **provided** values; `value` is the fallback
+  used only when the key is missing from the input map. The default is
+  injected as-is — it is not re-validated on every call.
+
+  ## Example
+
+      schema(%{
+        required(:name)    => string(:filled?),
+        optional(:role)    => default(one_of([:admin, :user, :guest]), :user),
+        optional(:retries) => default(integer(gte?: 0), 3),
+        optional(:tags)    => default(list_of(string(:filled?)), [])
+      })
+
+  ## Semantics
+
+  - **Key absent** → `value` is injected directly, inner spec not run.
+  - **Key present** → inner `spec` is run against the provided value normally.
+    An invalid provided value returns an error; the default does not rescue it.
+  - **Required key** → default has no effect on absence; required missing keys
+    always produce a missing-key error.
+
+  ## Composability
+
+  `default/2` accepts any conformable as its inner spec, including schemas,
+  list_of, maybe, and ref:
+
+      optional(:coords) => default(schema(%{required(:x) => integer()}), %{x: 0})
+      optional(:ref)    => default(maybe(string(:filled?)), nil)
+  """
+  @spec default(conformable(), term()) :: Default.t()
+  def default(spec, value), do: %Default{spec: spec, value: value}
 
   # ===========================================================================
   # Schema builders
@@ -592,7 +647,7 @@ defmodule Gladius do
   end
 
   # ===========================================================================
-  # gen/1 — generator inference (Step 4)
+  # gen/1 — generator inference
   # ===========================================================================
 
   @doc """
@@ -600,44 +655,12 @@ defmodule Gladius do
 
   Typed specs with named constraints are inferred automatically. Predicate-only
   specs require an explicit `:gen` override on `spec/2`.
-
-  ## Usage
-
-      use ExUnitProperties
-      import Gladius, except: [integer: 0, integer: 1, integer: 2,
-                               float: 0, float: 1, float: 2,
-                               string: 0, string: 1, string: 2,
-                               boolean: 0, atom: 0, atom: 1,
-                               list: 0, list: 1, list: 2, list_of: 1]
-
-      property "generated users always conform" do
-        user = schema(%{
-          required(:name) => string(:filled?),
-          required(:age)  => integer(gte?: 18, lte?: 120),
-          optional(:role) => atom(in?: [:admin, :user])
-        })
-        check all value <- Gladius.gen(user) do
-          assert Gladius.valid?(user, value)
-        end
-      end
-
-  ## Explicit generator override
-
-  For predicate-only specs, supply a generator via the `:gen` option:
-
-      even_int = spec(fn x -> is_integer(x) and rem(x, 2) == 0 end,
-                      gen: StreamData.filter(StreamData.integer(), &(rem(&1, 2) == 0)))
-
-      Gladius.gen(even_int)  # uses the explicit generator, no error
-
-  See `Gladius.Gen` for the full inference rule table.
-
-  > #### Availability {: .info}
-  > `gen/1` requires `stream_data` to be available. Add it to your deps
-  > with `only: [:dev, :test]` since it is a development and testing aid,
-  > not a production concern.
   """
   defdelegate gen(spec), to: Gladius.Gen
+
+  # ===========================================================================
+  # conform/2
+  # ===========================================================================
 
   @doc """
   Validates `value` against `spec`. Returns `{:ok, shaped_value}` on success,
@@ -664,11 +687,48 @@ defmodule Gladius do
   """
   @spec conform(conformable(), term()) :: conform_result()
 
+  # --- Struct input (transparent conversion) ----------------------------------
+  #
+  # Any Elixir struct is converted to a plain map before dispatch.
+  # Output is always a plain map — use conform_struct/2 to re-wrap.
+  def conform(spec, %{__struct__: _} = struct) do
+    conform(spec, Map.from_struct(struct))
+  end
+
+  # --- Default (fallback for absent optional keys) ----------------------------
+  #
+  # When called directly (key is PRESENT in the parent schema), Default
+  # delegates to its inner spec. The absent-key injection happens in the
+  # Schema clause below — Default itself just acts as a transparent wrapper
+  # when a value is actually being validated.
+  def conform(%Default{spec: inner_spec}, value) do
+    conform(inner_spec, value)
+  end
+
+  # --- Transform (post-validation) -------------------------------------------
+
+  def conform(%Transform{spec: inner_spec, fun: fun}, value) do
+    case conform(inner_spec, value) do
+      {:error, _} = err ->
+        err
+
+      {:ok, shaped} ->
+        try do
+          {:ok, fun.(shaped)}
+        rescue
+          e ->
+            {:error, [%Error{
+              predicate: :transform,
+              value: shaped,
+              message: "transform failed: #{Exception.message(e)}"
+            }]}
+        end
+    end
+  end
+
   # --- Spec (leaf) -----------------------------------------------------------
 
   # Coercion pre-processing — must be first among all %Spec{} clauses.
-  # Strips the coercion, applies it, then recurses with a clean spec.
-  # Every downstream clause continues to work without modification.
   def conform(%Spec{coercion: coerce_fn} = spec, value) when not is_nil(coerce_fn) do
     case coerce_fn.(value) do
       {:ok, coerced}  ->
@@ -687,8 +747,7 @@ defmodule Gladius do
   # `any()` — unconditional pass
   def conform(%Spec{type: :any}, value), do: {:ok, value}
 
-  # `nil_spec()` — only nil passes. Uses :null (not :nil) because in Elixir
-  # nil == :nil, which would collide with the unset zero-value of the type field.
+  # `nil_spec()`
   def conform(%Spec{type: :null}, nil),   do: {:ok, nil}
   def conform(%Spec{type: :null}, value), do: {:error, [type_error(:null, value, "must be nil")]}
 
@@ -715,7 +774,7 @@ defmodule Gladius do
     end
   end
 
-  # Typed + predicated spec (e.g. `spec(is_integer() and &(&1 > 0))`)
+  # Typed + predicated spec
   def conform(%Spec{type: type, predicate: pred, constraints: cs}, value)
       when not is_nil(type) and not is_nil(pred) do
     with :ok <- check_type(type, value),
@@ -730,12 +789,11 @@ defmodule Gladius do
     end
   end
 
-  # Empty spec (no type, no predicate) — passthrough, same as any()
+  # Empty spec — passthrough
   def conform(%Spec{type: nil, predicate: nil}, value), do: {:ok, value}
 
-  # --- All (AND / intersection) -----------------------------------------------
+  # --- All (AND) --------------------------------------------------------------
 
-  # Vacuous truth: all_of([]) always passes
   def conform(%All{specs: []}, value), do: {:ok, value}
 
   def conform(%All{specs: specs}, value) do
@@ -747,9 +805,8 @@ defmodule Gladius do
     end)
   end
 
-  # --- Any (OR / union) -------------------------------------------------------
+  # --- Any (OR) ---------------------------------------------------------------
 
-  # Vacuous failure: any_of([]) never passes
   def conform(%Any{specs: []}, value) do
     {:error, [%Error{value: value, message: "any_of([]) — empty union never conforms"}]}
   end
@@ -765,7 +822,7 @@ defmodule Gladius do
        [%Error{value: value, message: "value did not conform to any spec in any_of"}]}
   end
 
-  # --- Not (negation) ---------------------------------------------------------
+  # --- Not --------------------------------------------------------------------
 
   def conform(%Not{spec: spec}, value) do
     case conform(spec, value) do
@@ -773,18 +830,16 @@ defmodule Gladius do
         {:error, [%Error{value: value, message: "value must NOT conform to spec"}]}
 
       {:error, _} ->
-        # Negation succeeded — pass through the original value unchanged.
-        # (Negation cannot shape data, only gate it.)
         {:ok, value}
     end
   end
 
-  # --- Maybe (nullable) -------------------------------------------------------
+  # --- Maybe ------------------------------------------------------------------
 
   def conform(%Maybe{}, nil), do: {:ok, nil}
   def conform(%Maybe{spec: spec}, value), do: conform(spec, value)
 
-  # --- Ref (lazy registry resolution) ----------------------------------------
+  # --- Ref --------------------------------------------------------------------
 
   def conform(%Ref{name: name}, value) do
     spec = Gladius.Registry.fetch!(name)
@@ -794,14 +849,13 @@ defmodule Gladius do
       {:error, [%Error{value: value, message: Exception.message(e)}]}
   end
 
-  # --- ListOf (typed list) ----------------------------------------------------
+  # --- ListOf -----------------------------------------------------------------
 
   def conform(%ListOf{}, value) when not is_list(value) do
     {:error, [type_error(:list, value, "must be a list")]}
   end
 
   def conform(%ListOf{element_spec: el_spec}, value) when is_list(value) do
-    # Accumulate errors from ALL elements — do not short-circuit.
     {shaped_rev, errors} =
       value
       |> Enum.with_index()
@@ -811,7 +865,6 @@ defmodule Gladius do
             {[shaped | acc_shaped], acc_errs}
 
           {:error, elem_errors} ->
-            # Prepend the element index to each error's path
             indexed = prepend_path(elem_errors, idx)
             {[elem | acc_shaped], acc_errs ++ indexed}
         end
@@ -824,7 +877,7 @@ defmodule Gladius do
     end
   end
 
-  # --- Cond (conditional branching) -------------------------------------------
+  # --- Cond -------------------------------------------------------------------
 
   def conform(%Cond{predicate_fn: pred, if_spec: if_spec, else_spec: else_spec}, value) do
     if pred.(value),
@@ -832,7 +885,7 @@ defmodule Gladius do
       else: conform(else_spec, value)
   end
 
-  # --- Schema (map validation) ------------------------------------------------
+  # --- Schema -----------------------------------------------------------------
 
   def conform(%Schema{}, value) when not is_map(value) do
     {:error, [type_error(:map, value, "must be a map")]}
@@ -885,9 +938,33 @@ defmodule Gladius do
             {[{name, shaped} | acc_pairs], acc_errs}
 
           {:error, field_errors} ->
-            # Prepend the field name to each error's path
             keyed = prepend_path(field_errors, name)
             {acc_pairs, acc_errs ++ keyed}
+        end
+      end)
+
+    # 4. Inject defaults for absent optional keys whose spec is %Default{}.
+    # A %Ref{} may point to a %Default{}, so resolve one level of indirection.
+    default_pairs =
+      key_specs
+      |> Enum.reject(& &1.required)
+      |> Enum.reject(&Map.has_key?(value, &1.name))
+      |> Enum.flat_map(fn %SchemaKey{name: name, spec: spec} ->
+        resolved =
+          case spec do
+            %Ref{name: ref_name} ->
+              try do
+                Gladius.Registry.fetch!(ref_name)
+              rescue
+                Gladius.UndefinedSpecError -> spec
+              end
+            other ->
+              other
+          end
+
+        case resolved do
+          %Default{value: default_value} -> [{name, default_value}]
+          _                              -> []
         end
       end)
 
@@ -896,11 +973,9 @@ defmodule Gladius do
     if all_errors == [] do
       shaped =
         if open? do
-          # Open schemas: merge shaped values onto the original map to
-          # preserve unknown keys in the output
-          Map.merge(value, Map.new(shaped_pairs))
+          Map.merge(value, Map.new(shaped_pairs ++ default_pairs))
         else
-          Map.new(shaped_pairs)
+          Map.new(shaped_pairs ++ default_pairs)
         end
 
       {:ok, shaped}
@@ -916,10 +991,6 @@ defmodule Gladius do
   @doc """
   Returns `true` if `value` conforms to `spec`, `false` otherwise.
 
-  Equivalent to `match?({:ok, _}, conform(spec, value))`. Does not produce
-  error details — use `conform/2` for the shaped value, `explain/2` for a
-  human-readable error summary.
-
   ## Examples
 
       iex> import Gladius
@@ -932,11 +1003,40 @@ defmodule Gladius do
   def valid?(spec, value), do: match?({:ok, _}, conform(spec, value))
 
   @doc """
+  Like `conform/2` but accepts a struct as input and re-wraps the shaped
+  output in the same struct type on success.
+
+  Returns `{:error, [%Gladius.Error{}]}` if the input is not a struct.
+
+  ## Example
+
+      defmodule User do
+        defstruct [:name, :email]
+      end
+
+      s = schema(%{
+        required(:name)  => transform(string(:filled?), &String.trim/1),
+        required(:email) => string(:filled?, format: ~r/@/)
+      })
+
+      Gladius.conform_struct(s, %User{name: "  Mark  ", email: "m@x.com"})
+      #=> {:ok, %User{name: "Mark", email: "m@x.com"}}
+  """
+  @spec conform_struct(conformable(), struct()) :: {:ok, struct()} | {:error, [Error.t()]}
+  def conform_struct(_spec, value) when not is_struct(value) do
+    {:error, [%Error{value: value, message: "conform_struct/2 requires a struct, got: #{inspect(value)}"}]}
+  end
+
+  def conform_struct(spec, %{__struct__: mod} = struct) do
+    case conform(spec, Map.from_struct(struct)) do
+      {:ok, shaped_map} -> {:ok, struct(mod, shaped_map)}
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
   Returns a `%Gladius.ExplainResult{}` with structured errors and a
   pre-formatted string ready for display or logging.
-
-  For the raw `{:ok, val} | {:error, errors}` result, use `conform/2`.
-  For a simple boolean check, use `valid?/2`.
 
   ## Example
 
@@ -962,6 +1062,25 @@ defmodule Gladius do
         %ExplainResult{valid?: false, value: value, errors: errors, formatted: formatted}
     end
   end
+
+  # ===========================================================================
+  # Typespec bridge
+  # ===========================================================================
+
+  @doc """
+  Converts a Gladius spec to quoted Elixir typespec AST.
+
+      iex> import Gladius
+      iex> Macro.to_string(Gladius.to_typespec(integer(gte?: 0)))
+      "non_neg_integer()"
+  """
+  defdelegate to_typespec(spec), to: Gladius.Typespec
+
+  @doc """
+  Returns lossiness notices for a spec — `[{reason, description}]`.
+  Empty list means lossless.
+  """
+  defdelegate typespec_lossiness(spec), to: Gladius.Typespec, as: :lossiness
 
   # ===========================================================================
   # Private helpers
@@ -990,30 +1109,6 @@ defmodule Gladius do
       meta: %{expected_type: type, actual_type: type_of(value)}
     }
   end
-
-
-  # ===========================================================================
-  # Typespec conversion (Step 5 bridge to Elixir's type system)
-  # ===========================================================================
-
-  @doc """
-  Converts an gladius spec to quoted Elixir typespec AST.
-
-  Returns a valid `Macro.t()` in all cases. Constructs with no typespec
-  equivalent fall back to `term()` or their base type. Use
-  `typespec_lossiness/1` to see what was elided.
-
-      iex> import Gladius
-      iex> Macro.to_string(Gladius.to_typespec(integer(gte?: 0)))
-      "non_neg_integer()"
-  """
-  defdelegate to_typespec(spec), to: Gladius.Typespec
-
-  @doc """
-  Returns lossiness notices for a spec — `[{reason, description}]`.
-  Empty list means lossless. See `Gladius.Typespec` for full docs.
-  """
-  defdelegate typespec_lossiness(spec), to: Gladius.Typespec, as: :lossiness
 
   defp prepend_path(errors, key) do
     Enum.map(errors, fn err -> %{err | path: [key | err.path]} end)

@@ -1,7 +1,7 @@
 defmodule Gladius.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/Xs-and-10s/gladius"
 
   def project do
@@ -72,6 +72,7 @@ defmodule Gladius.MixProject do
 
   defp deps do
     [
+      {:ecto, "~> 3.0", optional: true},
       {:stream_data, "~> 1.1",  only: [:dev, :test]},
       {:ex_doc,      "~> 0.34", only: :dev, runtime: false}
     ]

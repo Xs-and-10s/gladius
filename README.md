@@ -1,6 +1,6 @@
 # Gladius
 
-**Parse, don't validate.** `conform/2` returns a *shaped* value on success — coercions applied, data restructured — not just `true`. Specs are composable structs, not modules. Write a spec once; use it to validate, generate test data, check function signatures, and produce typespecs.
+**Parse, don't validate.** `conform/2` returns a *shaped* value on success — coercions applied, transforms run, data restructured — not just `true`. Specs are composable structs, not modules. Write a spec once; use it to validate, generate test data, check function signatures, and produce typespecs.
 
 [![Hex.pm](https://img.shields.io/hexpm/v/gladius.svg)](https://hex.pm/packages/gladius)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/gladius)
@@ -15,6 +15,9 @@
 - [Named Constraints](#named-constraints)
 - [Combinators](#combinators)
 - [Schemas](#schemas)
+- [Default Values](#default-values)
+- [Post-Validation Transforms](#post-validation-transforms)
+- [Struct Validation](#struct-validation)
 - [Registry](#registry)
 - [Coercion](#coercion)
 - [Generators](#generators)
@@ -32,12 +35,12 @@
 # mix.exs
 def deps do
   [
-    {:gladius, "~> 0.1"}
+    {:gladius, "~> 0.2"}
   ]
 end
 ```
 
-gladius runs a registry under its own supervision tree — no configuration needed; it starts automatically with your application.
+Gladius runs a registry under its own supervision tree — no configuration needed; it starts automatically with your application.
 
 ---
 
@@ -185,10 +188,9 @@ list_of(integer(gte?: 0))
 
 ### `cond_spec/2-3` — conditional branching
 
-Applies one branch based on a predicate. Unlike `any_of`, makes a decision then conforms exactly one branch.
+Applies one branch based on a predicate.
 
 ```elixir
-# Physical orders need a shipping address; digital orders don't
 cond_spec(
   fn order -> order.type == :physical end,
   ref(:address_schema),
@@ -201,19 +203,17 @@ cond_spec(&is_binary/1, string(:filled?))
 
 ### `spec/1` — arbitrary predicate
 
-For cases named constraints can't express. Opaque to the generator — supply `:gen` explicitly if needed.
-
 ```elixir
-spec(&is_integer/1)                                           # guard function
-spec(&(&1 > 0))                                               # capture
-spec(fn n -> rem(n, 2) == 0 end)                             # anonymous function
-spec(is_integer() and &(&1 > 0))                             # guard + capture shorthand
-spec(&is_integer/1, gen: StreamData.integer(1..1000))        # with explicit generator
+spec(&is_integer/1)
+spec(&(&1 > 0))
+spec(fn n -> rem(n, 2) == 0 end)
+spec(is_integer() and &(&1 > 0))
+spec(&is_integer/1, gen: StreamData.integer(1..1000))
 ```
 
 ### `coerce/2` — coercion wrapper
 
-See [Coercion](#coercion) for the full reference. Coercions are combinators — they compose freely.
+See [Coercion](#coercion) for the full reference.
 
 ```elixir
 coerce(integer(gte?: 0), from: :string)    # parse then validate
@@ -240,15 +240,6 @@ user_schema = schema(%{
     required(:zip)    => string(size?: 5)
   })
 })
-
-Gladius.conform(user_schema, %{
-  name: "Mark",
-  email: "mark@x.com",
-  age: 33,
-  address: %{street: "1 Main St", zip: "22701"}
-})
-#=> {:ok, %{name: "Mark", email: "mark@x.com", age: 33,
-#=>         address: %{street: "1 Main St", zip: "22701"}}}
 ```
 
 ### `open_schema/1` — extra keys pass through
@@ -262,23 +253,177 @@ Gladius.conform(base, %{id: 1, extra: "anything"})
 
 ### `ref/1` — lazy registry reference
 
-Resolved at conform-time, not build-time. Enables circular schemas.
+Resolved at conform-time. Enables circular schemas.
 
 ```elixir
 defspec :tree_node, schema(%{
   required(:value)    => integer(),
-  optional(:children) => list_of(ref(:tree_node))   # circular — works fine
+  optional(:children) => list_of(ref(:tree_node))
+})
+```
+
+---
+
+## Default Values
+
+`default/2` injects a fallback value when an optional key is absent. The fallback is injected as-is — the inner spec only runs when the key is **present**.
+
+```elixir
+schema(%{
+  required(:name)    => string(:filled?),
+  optional(:role)    => default(atom(in?: [:admin, :user, :guest]), :user),
+  optional(:retries) => default(integer(gte?: 0), 3),
+  optional(:tags)    => default(list_of(string(:filled?)), [])
 })
 
-Gladius.conform(ref(:tree_node), %{
-  value: 1,
-  children: [
-    %{value: 2, children: []},
-    %{value: 3}
-  ]
-})
-#=> {:ok, %{value: 1, children: [%{value: 2, children: []}, %{value: 3}]}}
+Gladius.conform(schema, %{name: "Mark"})
+#=> {:ok, %{name: "Mark", role: :user, retries: 3, tags: []}}
 ```
+
+**Semantics:**
+- Key absent → fallback injected directly; inner spec not run
+- Key present → inner spec validates the provided value normally
+- Invalid provided value → error returned; default does not rescue it
+- Required key → `default/2` has no effect on absence; missing required keys always error
+
+`default/2` accepts any conformable as its inner spec:
+
+```elixir
+optional(:coords)  => default(schema(%{required(:x) => integer()}), %{x: 0})
+optional(:ref)     => default(maybe(string(:filled?)), nil)
+optional(:wrapped) => default(ref(:address), %{street: "unknown", zip: "00000"})
+```
+
+---
+
+## Post-Validation Transforms
+
+`transform/2` applies a function to the shaped value **after** validation succeeds. It never runs on invalid data.
+
+**Pipeline:** `raw → coerce → validate → transform → {:ok, result}`
+
+```elixir
+# Normalize strings at the boundary
+email_spec = transform(string(:filled?, format: ~r/@/), &String.downcase/1)
+name_spec  = transform(string(:filled?), &String.trim/1)
+
+schema(%{
+  required(:name)  => name_spec,
+  required(:email) => email_spec
+})
+
+Gladius.conform(schema, %{name: "  Mark  ", email: "MARK@X.COM"})
+#=> {:ok, %{name: "Mark", email: "mark@x.com"}}
+```
+
+Chain transforms with pipe — `transform/2` is spec-first for exactly this reason:
+
+```elixir
+string(:filled?)
+|> transform(&String.trim/1)
+|> transform(&String.downcase/1)
+```
+
+Enrich a schema output:
+
+```elixir
+transform(
+  schema(%{required(:name) => string(:filled?)}),
+  fn m -> Map.put(m, :slug, String.downcase(m.name)) end
+)
+```
+
+**Error handling:** if the transform function raises, the exception is caught and returned as `%Gladius.Error{predicate: :transform, message: "transform failed: ..."}`. The caller never crashes.
+
+**With defaults:** when `default/2` wraps a `transform/2`, the default value bypasses the transform entirely (consistent with bypassing the inner spec):
+
+```elixir
+optional(:name) => default(transform(string(:filled?), &String.trim/1), "anon")
+# key absent → "anon" injected, trim never runs
+# key present → trimmed and validated normally
+```
+
+---
+
+## Struct Validation
+
+### Structs as input to `conform/2`
+
+`conform/2` accepts any Elixir struct directly — no `Map.from_struct/1` needed. The output is a plain map.
+
+```elixir
+defmodule User do
+  defstruct [:name, :email, :age]
+end
+
+s = schema(%{
+  required(:name)  => transform(string(:filled?), &String.trim/1),
+  required(:email) => string(:filled?, format: ~r/@/)
+})
+
+Gladius.conform(s, %User{name: "  Mark  ", email: "mark@x.com"})
+#=> {:ok, %{name: "Mark", email: "mark@x.com"}}
+```
+
+`valid?/2` and `explain/2` accept structs the same way.
+
+### `conform_struct/2` — validate and re-wrap
+
+When you need the shaped output back in the original struct type:
+
+```elixir
+Gladius.conform_struct(s, %User{name: "  Mark  ", email: "mark@x.com"})
+#=> {:ok, %User{name: "Mark", email: "mark@x.com"}}
+```
+
+Coercions and transforms are reflected in the returned struct:
+
+```elixir
+s = schema(%{
+  required(:name) => transform(string(:filled?), &String.trim/1),
+  required(:age)  => coerce(integer(), from: :string)
+})
+
+Gladius.conform_struct(s, %User{name: "  Mark  ", age: "33"})
+#=> {:ok, %User{name: "Mark", age: 33}}
+```
+
+Errors are the same `{:error, [%Gladius.Error{}]}` format as `conform/2`. A plain map (non-struct) input returns an error immediately.
+
+### `defschema struct: true` — schema + struct in one
+
+Defines the validator functions **and** a matching output struct in a single declaration. The struct module is named `<CallerModule>.<PascalName>Schema`.
+
+```elixir
+defmodule MyApp.Schemas do
+  import Gladius
+
+  defschema :point, struct: true do
+    schema(%{
+      required(:x) => integer(),
+      required(:y) => integer()
+    })
+  end
+
+  defschema :person, struct: true do
+    schema(%{
+      required(:name)  => transform(string(:filled?), &String.trim/1),
+      optional(:score) => default(integer(gte?: 0), 0)
+    })
+  end
+end
+
+MyApp.Schemas.point(%{x: 3, y: 4})
+#=> {:ok, %MyApp.Schemas.PointSchema{x: 3, y: 4}}
+
+MyApp.Schemas.person(%{name: "  Mark  "})
+#=> {:ok, %MyApp.Schemas.PersonSchema{name: "Mark", score: 0}}
+
+MyApp.Schemas.point!(%{x: "bad", y: 0})
+#=> raises Gladius.ConformError
+```
+
+Transforms run before struct wrapping; defaults are injected before struct wrapping.
 
 ---
 
@@ -297,7 +442,7 @@ defmodule MyApp.Specs do
 end
 ```
 
-Reference with `ref/1` from anywhere in the codebase:
+Reference with `ref/1` from anywhere:
 
 ```elixir
 schema(%{
@@ -327,9 +472,8 @@ defmodule MyApp.Schemas do
 
   defschema :create_params do
     schema(%{
-      required(:email)    => coerce(ref(:email),    from: :string),
-      required(:age)      => coerce(integer(gte?: 18), from: :string),
-      optional(:username) => coerce(ref(:username), from: :string)
+      required(:email) => coerce(ref(:email), from: :string),
+      required(:age)   => coerce(integer(gte?: 18), from: :string)
     })
   end
 end
@@ -370,44 +514,34 @@ end)
 All built-in coercions are **idempotent** — already-correct values pass through unchanged.
 
 ```elixir
-coerce(integer(),  from: :string)   # "42"   → 42      (trims whitespace)
-coerce(float(),    from: :string)   # "3.14" → 3.14    (integers pass as floats)
-coerce(boolean(),  from: :string)   # "true" → true    (yes/1/on also work)
-coerce(atom(),     from: :string)   # "ok"   → :ok     (existing atoms only — safe)
+coerce(integer(),  from: :string)   # "42"   → 42
+coerce(float(),    from: :string)   # "3.14" → 3.14
+coerce(boolean(),  from: :string)   # "true" → true  (yes/1/on also work)
+coerce(atom(),     from: :string)   # "ok"   → :ok   (existing atoms only)
 coerce(float(),    from: :integer)  # 42     → 42.0
 coerce(string(),   from: :integer)  # 42     → "42"
-coerce(boolean(),  from: :integer)  # 0      → false, 1 → true (others fail)
+coerce(boolean(),  from: :integer)  # 0      → false, 1 → true
 coerce(string(),   from: :atom)     # :ok    → "ok"
-coerce(integer(),  from: :float)    # 3.7    → 3       (truncates toward zero)
+coerce(integer(),  from: :float)    # 3.7    → 3
 coerce(string(),   from: :float)    # 3.14   → "3.14"
 ```
 
 ### User-extensible coercion registry
 
-Register at application startup. User coercions take **precedence over built-ins** for the same `{source, target}` pair.
-
 ```elixir
-# In Application.start/2 or a @on_load:
 Gladius.Coercions.register({:decimal, :float}, fn
-  %Decimal{} = d  -> {:ok, Decimal.to_float(d)}
+  %Decimal{} = d     -> {:ok, Decimal.to_float(d)}
   v when is_float(v) -> {:ok, v}
   v -> {:error, "cannot coerce #{inspect(v)} to float"}
 end)
 
-# Then anywhere in your app:
 coerce(float(gt?: 0.0), from: :decimal)
 ```
-
-`:persistent_term` backs the registry — reads are free, writes trigger a GC pass. Register once at startup, not in hot paths.
 
 ### Composition patterns
 
 ```elixir
-# Nullable coercion
-maybe(coerce(integer(gte?: 0), from: :string))
-# nil → {:ok, nil}  |  "42" → {:ok, 42}  |  "-5" → {:error, gte? failure}
-
-# HTTP params / form data schema
+# HTTP params / form data
 http_params = schema(%{
   required(:age)    => coerce(integer(gte?: 18), from: :string),
   required(:active) => coerce(boolean(),          from: :string),
@@ -418,7 +552,7 @@ http_params = schema(%{
 Gladius.conform(http_params, %{age: "25", active: "true", score: "9.5", role: "admin"})
 #=> {:ok, %{age: 25, active: true, score: 9.5, role: :admin}}
 
-# Coercion in list_of — every element is coerced
+# Coerce every list element
 list_of(coerce(integer(), from: :string))
 # ["1", "2", "3"] → {:ok, [1, 2, 3]}
 ```
@@ -430,24 +564,21 @@ list_of(coerce(integer(), from: :string))
 `gen/1` infers a `StreamData` generator from any spec. Available in `:dev` and `:test` — zero overhead in `:prod`.
 
 ```elixir
-import Gladius
-
-gen(string(:filled?))                        # non-empty strings
-gen(integer(gte?: 0, lte?: 100))            # integers 0–100
-gen(atom(in?: [:admin, :user]))             # :admin or :user
-gen(maybe(integer()))                        # nil | integer
-gen(list_of(string(:filled?)))              # list of non-empty strings
-gen(any_of([integer(), string()]))          # integer | string
-gen(schema(%{
-  required(:name) => string(:filled?),
-  required(:age)  => integer(gte?: 0)
-}))                                          # map matching the schema
+gen(string(:filled?))
+gen(integer(gte?: 0, lte?: 100))
+gen(atom(in?: [:admin, :user]))
+gen(maybe(integer()))
+gen(list_of(string(:filled?)))
+gen(any_of([integer(), string()]))
+gen(schema(%{required(:name) => string(:filled?), required(:age) => integer(gte?: 0)}))
+gen(default(integer(gte?: 0), 0))    # delegates to inner spec
+gen(transform(integer(), &(&1 * 2))) # delegates to inner spec
 ```
 
 Use with `ExUnitProperties`:
 
 ```elixir
-defmodule MyApp.SpecTest do
+defmodule MyApp.PropertyTest do
   use ExUnitProperties
   import Gladius
 
@@ -465,20 +596,11 @@ defmodule MyApp.SpecTest do
 end
 ```
 
-Custom generator for opaque specs — supply `:gen` explicitly:
-
-```elixir
-even = spec(&(rem(&1, 2) == 0), gen: StreamData.map(StreamData.integer(), &(&1 * 2)))
-gen(even)   # generates even integers
-```
-
 ---
 
 ## Function Signatures
 
-`use Gladius.Signature` enables runtime validation in `:dev` and `:test`. **Zero overhead in `:prod`** — the macro compiles the wrappers away entirely.
-
-### Basic usage
+`use Gladius.Signature` enables runtime validation in `:dev` and `:test`. **Zero overhead in `:prod`.**
 
 ```elixir
 defmodule MyApp.Users do
@@ -487,14 +609,12 @@ defmodule MyApp.Users do
   signature args: [string(:filled?), integer(gte?: 18)],
             ret:  boolean()
   def register(email, age) do
-    # impl — receives validated arguments
     true
   end
 end
 
 MyApp.Users.register("mark@x.com", 33)   #=> true
 MyApp.Users.register("", 33)             #=> raises SignatureError
-MyApp.Users.register("mark@x.com", 15)  #=> raises SignatureError
 ```
 
 ### Options
@@ -505,41 +625,21 @@ MyApp.Users.register("mark@x.com", 15)  #=> raises SignatureError
 | `:ret`  | Return value |
 | `:fn`   | `{coerced_args_list, return_value}` — input/output relationships |
 
-```elixir
-# :fn — return must be >= first argument
-signature args: [integer(), integer()],
-          ret:  integer(),
-          fn:   spec(fn {[a, _b], ret} -> ret >= a end)
-def add(a, b), do: a + b
-```
-
-### Multi-clause functions
-
-Declare `signature` once, before the **first** clause only.
-
-```elixir
-signature args: [integer()], ret: integer()
-def factorial(0), do: 1
-def factorial(n) when n > 0, do: n * factorial(n - 1)
-```
-
 ### Coercion threading
 
-When `:args` specs include coercions, **the coerced values are forwarded to the impl** — not the originals.
+When `:args` specs include coercions, **coerced values are forwarded to the impl**.
 
 ```elixir
 signature args: [coerce(integer(gte?: 0), from: :string)],
           ret:  string()
 def double(n), do: Integer.to_string(n * 2)
 
-MyApp.double("5")    #=> "10"   — impl receives integer 5, not string "5"
-MyApp.double(5)      #=> "10"   — already integer, passes through
-MyApp.double("bad")  #=> raises SignatureError
+MyApp.double("5")   #=> "10"
 ```
 
 ### Path errors
 
-**All failing arguments are collected in one raise.** Nested schema field failures include the full path down to the failing field.
+All failing arguments are collected in one raise, with full nested paths:
 
 ```elixir
 signature args: [schema(%{
@@ -551,94 +651,29 @@ def create(params), do: true
 
 MyApp.create(%{email: "bad", name: ""})
 # raises Gladius.SignatureError:
-#   MyApp.create/1 argument error:
-#     argument[0][:email]: format must match ~r/@/
-#     argument[0][:name]: must be filled
-
-# SignatureError.errors contains:
-# [
-#   %Gladius.Error{path: [{:arg, 0}, :email], message: "format must match ~r/@/"},
-#   %Gladius.Error{path: [{:arg, 0}, :name],  message: "must be filled"}
-# ]
+#   argument[0][:email]: format must match ~r/@/
+#   argument[0][:name]: must be filled
 ```
 
 ---
 
 ## Typespec Bridge
 
-Converts gladius specs to quoted Elixir typespec AST. Bridges runtime validation and the compile-time type system — specs become the single source of truth for both.
-
-### `to_typespec/1`
-
 ```elixir
-import Gladius
-alias Macro
-
-Macro.to_string(Gladius.to_typespec(integer(gte?: 0)))            #=> "non_neg_integer()"
-Macro.to_string(Gladius.to_typespec(integer(gt?: 0)))             #=> "pos_integer()"
-Macro.to_string(Gladius.to_typespec(integer(gte?: 1, lte?: 100))) #=> "1..100"
-Macro.to_string(Gladius.to_typespec(atom(in?: [:a, :b])))         #=> ":a | :b"
-Macro.to_string(Gladius.to_typespec(maybe(string())))             #=> "String.t() | nil"
-Macro.to_string(Gladius.to_typespec(list_of(integer())))          #=> "[integer()]"
-Macro.to_string(Gladius.to_typespec(ref(:email)))                 #=> "email()"
-Macro.to_string(Gladius.to_typespec(any_of([string(), integer()]))) #=> "String.t() | integer()"
-
-Macro.to_string(Gladius.to_typespec(schema(%{
-  required(:name) => string(),
-  optional(:age)  => integer(gte?: 0)
-})))
-#=> "%{required(:name) => String.t(), optional(:age) => non_neg_integer()}"
-```
-
-### Fidelity table
-
-| Gladius spec | Elixir typespec | Fidelity |
-|-------------|-----------------|----------|
-| `string()` | `String.t()` | exact |
-| `integer(gte?: 0)` | `non_neg_integer()` | exact |
-| `integer(gt?: 0)` | `pos_integer()` | exact |
-| `integer(gte?: a, lte?: b)` | `a..b` | exact |
-| `integer(in?: [1, 2, 3])` | `1 \| 2 \| 3` | exact |
-| `atom(in?: [:a, :b])` | `:a \| :b` | exact |
-| `float()` / `number()` / `boolean()` / `atom()` | same | exact |
-| `nil_spec()` | `nil` | exact |
-| `maybe(s)` | `T \| nil` | exact |
-| `list_of(s)` | `[T]` | exact |
-| `any_of([s1, s2])` | `T1 \| T2` | exact |
-| `ref(:name)` | `name()` | exact |
-| `schema(%{...})` / `open_schema` | `%{required(:k) => T, ...}` | exact |
-| `string(:filled?)` | `String.t()` | lossy — constraint elided |
-| `all_of([s1, s2])` | first typed spec's type | lossy — intersection unsupported |
-| `cond_spec(f, s1, s2)` | `T1 \| T2` | lossy — predicate elided |
-| `not_spec(s)` | `term()` | inexpressible |
-| `coerce(s, ...)` | target type only | lossy — input type omitted |
-
-### `typespec_lossiness/1`
-
-```elixir
-Gladius.typespec_lossiness(string(:filled?))
-#=> [{:constraint_not_expressible, "filled?: true has no typespec equivalent"}]
-
-Gladius.typespec_lossiness(not_spec(integer()))
-#=> [{:negation_not_expressible, "not_spec has no typespec equivalent; term() used"}]
-
-Gladius.typespec_lossiness(integer(gte?: 0, lte?: 100))
-#=> []   # lossless
+Macro.to_string(Gladius.to_typespec(integer(gte?: 0)))             #=> "non_neg_integer()"
+Macro.to_string(Gladius.to_typespec(integer(gt?: 0)))              #=> "pos_integer()"
+Macro.to_string(Gladius.to_typespec(integer(gte?: 1, lte?: 100)))  #=> "1..100"
+Macro.to_string(Gladius.to_typespec(atom(in?: [:a, :b])))          #=> ":a | :b"
+Macro.to_string(Gladius.to_typespec(maybe(string())))              #=> "String.t() | nil"
+Macro.to_string(Gladius.to_typespec(default(integer(), 0)))        #=> "integer()"
+Macro.to_string(Gladius.to_typespec(transform(string(), &String.trim/1))) #=> "String.t()"
 ```
 
 ### `@type` generation
 
-`defspec` and `defschema` accept `type: true` to auto-generate a `@type` declaration. Lossy constraints emit **compile-time warnings** pointing to the call site.
-
 ```elixir
-import Gladius
-
-defspec :user_id,   integer(gte?: 1),   type: true
+defspec :user_id, integer(gte?: 1), type: true
 # @type user_id :: pos_integer()
-
-defspec :email,     string(:filled?, format: ~r/@/), type: true
-# @type email :: String.t()
-# warning: defspec :email type: format: ~r"/@/" has no typespec equivalent
 
 defschema :profile, type: true do
   schema(%{
@@ -652,21 +687,11 @@ end
 #                    optional(:role) => :admin | :user}
 ```
 
-For macro injection, `Gladius.Typespec.type_ast/2` returns the `@type` declaration AST directly:
-
-```elixir
-ast = Gladius.Typespec.type_ast(:my_type, integer(gte?: 0))
-# Inject into a module at compile time:
-Module.eval_quoted(MyModule, ast)
-```
-
 ---
 
 ## Testing
 
 ### Process-local registry for async tests
-
-Never use `Gladius.Registry.clear/0` in async tests — it clears the global ETS table. Use the process-local overlay instead.
 
 ```elixir
 defmodule MyApp.SpecTest do
@@ -691,29 +716,15 @@ end
 ### Property-based testing
 
 ```elixir
-defmodule MyApp.PropertyTest do
-  use ExUnitProperties
-  import Gladius
+property "generated values always conform" do
+  spec = schema(%{
+    required(:name)  => string(:filled?),
+    required(:age)   => integer(gte?: 0, lte?: 150),
+    optional(:score) => float(gte?: 0.0, lte?: 1.0)
+  })
 
-  property "generated values always conform" do
-    spec = schema(%{
-      required(:name)  => string(:filled?),
-      required(:age)   => integer(gte?: 0, lte?: 150),
-      optional(:score) => float(gte?: 0.0, lte?: 1.0)
-    })
-
-    check all value <- gen(spec) do
-      assert {:ok, _} = Gladius.conform(spec, value)
-    end
-  end
-
-  property "conform is idempotent for valid values" do
-    spec = string(:filled?)
-
-    check all value <- gen(spec) do
-      {:ok, shaped} = Gladius.conform(spec, value)
-      assert Gladius.conform(spec, shaped) == {:ok, shaped}
-    end
+  check all value <- gen(spec) do
+    assert {:ok, _} = Gladius.conform(spec, value)
   end
 end
 ```
@@ -730,6 +741,10 @@ end
 | Function signatures | ✓ | ✓ | — | — |
 | Coercion pipeline | ✓ | — | ✓ | — |
 | User coercion registry | ✓ | — | — | — |
+| Default values | ✓ | — | — | ✓ |
+| Post-validation transforms | ✓ | — | — | — |
+| Struct validation | ✓ | — | — | — |
+| Ecto integration | ✓ | — | — | ✓ |
 | Typespec bridge | ✓ | — | — | — |
 | `@type` generation | ✓ | — | — | — |
 | Circular schemas (`ref`) | ✓ | — | — | — |
@@ -740,14 +755,12 @@ end
 
 ## AI Agent Reference
 
-This section is structured for machine consumption. Complete API surface, all constraint names, error formats, and behavioural guarantees.
-
 ### Module map
 
 | Module | Purpose |
 |--------|---------|
 | `Gladius` | Primary API — `import Gladius` |
-| `Gladius.Signature` | Function signature validation — `use Gladius.Signature` in module |
+| `Gladius.Signature` | Function signature validation — `use Gladius.Signature` |
 | `Gladius.Typespec` | Spec → typespec AST conversion |
 | `Gladius.Coercions` | Coercion functions + user registry |
 | `Gladius.Registry` | Named spec registry (ETS + process-local) |
@@ -767,42 +780,46 @@ number()  | boolean() | map() | list() | any() | nil_spec()
 atom()    | atom(kw)
 
 # Combinators
-all_of([conformable()])                          :: All.t()
-any_of([conformable()])                          :: Any.t()
-not_spec(conformable())                          :: Not.t()
-maybe(conformable())                             :: Maybe.t()
-list_of(conformable())                           :: ListOf.t()
-cond_spec(pred_fn, if_spec)                      :: Cond.t()
-cond_spec(pred_fn, if_spec, else_spec)           :: Cond.t()
+all_of([conformable()])                            :: All.t()
+any_of([conformable()])                            :: Any.t()
+not_spec(conformable())                            :: Not.t()
+maybe(conformable())                               :: Maybe.t()
+list_of(conformable())                             :: ListOf.t()
+cond_spec(pred_fn, if_spec)                        :: Cond.t()
+cond_spec(pred_fn, if_spec, else_spec)             :: Cond.t()
 coerce(Spec.t(), (term -> {:ok, t} | {:error, s})) :: Spec.t()
-coerce(Spec.t(), from: source_atom)              :: Spec.t()
-ref(atom)                                        :: Ref.t()
-spec(pred_or_guard_expr)                         :: Spec.t()
-spec(pred_or_guard_expr, gen: StreamData.t())    :: Spec.t()
+coerce(Spec.t(), from: source_atom)                :: Spec.t()
+default(conformable(), term())                     :: Default.t()
+transform(conformable(), (term() -> term()))       :: Transform.t()
+ref(atom)                                          :: Ref.t()
+spec(pred_or_guard_expr)                           :: Spec.t()
+spec(pred_or_guard_expr, gen: StreamData.t())      :: Spec.t()
 
 # Schema
-schema(%{schema_key => conformable()})           :: Schema.t()
-open_schema(%{schema_key => conformable()})      :: Schema.t()
-required(atom)   # → SchemaKey used as map key in schema/1
-optional(atom)   # → SchemaKey used as map key in schema/1
+schema(%{schema_key => conformable()})             :: Schema.t()
+open_schema(%{schema_key => conformable()})        :: Schema.t()
+required(atom)
+optional(atom)
 
-# Registration (macros — expand at compile time)
+# Registration (macros)
 defspec name_atom, spec_expr
 defspec name_atom, spec_expr, type: true
 defschema name_atom do spec_expr end
 defschema name_atom, type: true do spec_expr end
+defschema name_atom, struct: true do spec_expr end
 
 # Validation
-Gladius.conform(conformable(), term()) :: {:ok, term()} | {:error, [Error.t()]}
-Gladius.valid?(conformable(), term())  :: boolean()
-Gladius.explain(conformable(), term()) :: ExplainResult.t()
+Gladius.conform(conformable(), term())        :: {:ok, term()} | {:error, [Error.t()]}
+Gladius.conform_struct(conformable(), struct()) :: {:ok, struct()} | {:error, [Error.t()]}
+Gladius.valid?(conformable(), term())         :: boolean()
+Gladius.explain(conformable(), term())        :: ExplainResult.t()
 
-# Generator (dev/test only — raises in prod)
+# Generator (dev/test only)
 Gladius.gen(conformable()) :: StreamData.t()
 
 # Typespec
-Gladius.to_typespec(conformable())         :: Macro.t()
-Gladius.typespec_lossiness(conformable())  :: [{atom(), String.t()}]
+Gladius.to_typespec(conformable())             :: Macro.t()
+Gladius.typespec_lossiness(conformable())      :: [{atom(), String.t()}]
 Gladius.Typespec.type_ast(atom, conformable()) :: Macro.t()
 ```
 
@@ -830,115 +847,87 @@ in?: [atoms]       member of atom list
 ### All built-in coercion pairs
 
 ```
-{:string,  :integer}   Integer.parse, trims whitespace, strict (no trailing chars)
-{:string,  :float}     Float.parse; integers pass through as floats
-{:string,  :boolean}   true/yes/1/on → true; false/no/0/off → false (case-insensitive)
-{:string,  :atom}      String.to_existing_atom — safe against atom table exhaustion
+{:string,  :integer}
+{:string,  :float}
+{:string,  :boolean}   true/yes/1/on → true; false/no/0/off → false
+{:string,  :atom}      String.to_existing_atom — safe
 {:string,  :number}    same as {:string, :float}
-{:integer, :float}     n * 1.0
-{:integer, :string}    Integer.to_string
-{:integer, :boolean}   0 → false, 1 → true; any other integer → error
-{:atom,    :string}    Atom.to_string; nil → error (nil is an atom in Elixir)
-{:float,   :integer}   trunc/1 — truncates toward zero; 3.7 → 3, -3.7 → -3
-{:float,   :string}    "#{v}"
+{:integer, :float}
+{:integer, :string}
+{:integer, :boolean}   0 → false, 1 → true; others → error
+{:atom,    :string}    nil → error (nil is an atom in Elixir)
+{:float,   :integer}   trunc/1 — truncates toward zero
+{:float,   :string}
 ```
 
-All coercions are idempotent: values already of the target type pass through unchanged.
+All coercions are idempotent.
+
+### `default/2` semantics
+
+```
+default(spec, value)
+
+Key absent  + optional  → value injected; spec not run
+Key absent  + required  → missing-key error; default ignored
+Key present             → spec validates the provided value; value ignored
+Invalid provided value  → error returned; value does not rescue it
+Ref pointing to Default → resolved at conform-time; default injection works
+```
+
+### `transform/2` semantics
+
+```
+transform(spec, fun)
+
+Pipeline: raw → conform(spec) → fun.(shaped) → {:ok, result}
+
+Validation fails    → {:error, errors} passed through; fun never called
+fun.(shaped) raises → {:error, [%Error{predicate: :transform, ...}]}
+fun.(shaped) ok     → {:ok, fun_return_value}
+
+Chaining:   spec |> transform(f) |> transform(g)  — g receives output of f
+With coerce: coerce runs before validate; transform runs after
+With default: absent key bypasses both inner spec and transform
+```
+
+### `conform_struct/2` semantics
+
+```
+conform_struct(spec, struct)
+
+Non-struct input → {:error, [%Error{message: "conform_struct/2 requires a struct..."}]}
+Valid struct     → {:ok, struct(original_module, shaped_map)}
+Invalid struct   → {:error, [%Gladius.Error{}]}  — same format as conform/2
+```
+
+### `defschema struct: true` behaviour
+
+```
+defschema :point, struct: true do
+  schema(%{required(:x) => integer(), required(:y) => integer()})
+end
+
+Generated:
+  - Module <CallerModule>.PointSchema with defstruct [:x, :y]
+  - def point(data)  :: {:ok, %PointSchema{}} | {:error, [Error.t()]}
+  - def point!(data) :: %PointSchema{} | raises ConformError
+
+Struct field names derived from schema key names at compile time.
+Transforms and defaults run before struct wrapping.
+```
 
 ### `Gladius.Error` struct
 
 ```elixir
 %Gladius.Error{
   path:      [atom() | non_neg_integer()],
-  # [] = root-level failure
-  # [:email] = top-level key failure
-  # [:address, :zip] = nested key failure
-  # [:items, 2, :name] = list element nested failure
-
   predicate: atom() | nil,
-  # named constraints: :filled?, :gte?, :gt?, :lte?, :lt?, :format, :in?,
-  #                    :min_length, :max_length, :size?, :coerce
-  # arbitrary spec:    nil
-
-  value:     term(),   # the value that failed (after coercion if any)
+  # :filled?, :gte?, :gt?, :lte?, :lt?, :format, :in?,
+  # :min_length, :max_length, :size?, :coerce, :transform
+  value:     term(),
   message:   String.t(),
   meta:      map()
 }
-
-# String.Chars impl:
-to_string(%Error{path: [], message: "must be a map"})
-#=> "must be a map"
-
-to_string(%Error{path: [:address, :zip], message: "must be 5 characters"})
-#=> ":address.:zip: must be 5 characters"
-
-to_string(%Error{path: [:items, 2, :name], message: "must be filled"})
-#=> ":items.[2].:name: must be filled"
-```
-
-### `Gladius.SignatureError` struct
-
-```elixir
-%Gladius.SignatureError{
-  module:   module(),
-  function: atom(),
-  arity:    non_neg_integer(),
-  kind:     :args | :ret | :fn,
-  errors:   [Gladius.Error.t()]
-}
-
-# Error path prefixes injected by Gladius.Signature:
-# {:arg, 0}  → "argument[0]"   for args errors
-# :ret        → "return"         for ret errors
-# :fn         → "fn"             for fn errors
-
-# Example paths in errors:
-[{:arg, 0}]            # root-level arg failure (wrong type, etc.)
-[{:arg, 0}, :email]    # arg 0 is a schema; :email field failed
-[{:arg, 0}, :items, 2] # arg 0 is a schema; items[2] failed
-[:ret]                 # return value root-level failure
-[:ret, :name]          # return is a schema; :name field failed
-
-# Exception.message/1 format:
-"MyApp.Users.register/2 argument error:\n  argument[0][:email]: must be filled\n  argument[1]: must be >= 18"
-```
-
-### `Gladius.Registry` API
-
-```elixir
-# Global ETS-backed (survives process restarts)
-Gladius.Registry.register(name :: atom, spec :: conformable()) :: :ok
-Gladius.Registry.unregister(name :: atom)                      :: :ok
-Gladius.Registry.fetch!(name :: atom)                          :: conformable()  # raises if missing
-Gladius.Registry.registered?(name :: atom)                     :: boolean()
-Gladius.Registry.all()                                         :: %{atom => conformable()}
-Gladius.Registry.clear()                                       :: :ok  # DANGER: global, avoid in async tests
-
-# Process-local overlay (for async-safe test isolation)
-Gladius.Registry.register_local(name :: atom, spec :: conformable()) :: :ok
-Gladius.Registry.unregister_local(name :: atom)                      :: :ok
-Gladius.Registry.clear_local()                                       :: :ok  # safe in on_exit
-```
-
-`fetch!/1` checks the process-local overlay first, then the global ETS table.
-
-### `Gladius.Coercions` API
-
-```elixir
-Gladius.Coercions.register({source :: atom, target :: atom}, fun :: (term -> {:ok, t} | {:error, s})) :: :ok
-Gladius.Coercions.registered() :: %{{atom, atom} => function()}
-Gladius.Coercions.lookup(source :: atom, target :: atom) :: function()
-# Raises ArgumentError if no coercion exists (programming error, not data error)
-```
-
-### Typespec lossiness reasons
-
-```
-:constraint_not_expressible     string constraints: filled?, format:, min_length:, max_length:, size?
-:intersection_not_expressible   all_of: first typed spec used, rest ignored
-:negation_not_expressible       not_spec: falls back to term()
-:predicate_not_expressible      cond_spec: predicate fn lost; union of branches used
-:coercion_not_expressible       coerce: only target type appears; input type not represented
 ```
 
 ### Type union — the `conformable()` type
@@ -954,26 +943,46 @@ conformable() =
   | Gladius.ListOf    # list_of
   | Gladius.Cond      # cond_spec
   | Gladius.Schema    # schema / open_schema
+  | Gladius.Default   # default
+  | Gladius.Transform # transform
+```
+
+### `Gladius.Registry` API
+
+```elixir
+Gladius.Registry.register(name, spec)          :: :ok
+Gladius.Registry.unregister(name)              :: :ok
+Gladius.Registry.fetch!(name)                  :: conformable()
+Gladius.Registry.registered?(name)             :: boolean()
+Gladius.Registry.all()                         :: %{atom => conformable()}
+Gladius.Registry.clear()                       :: :ok  # DANGER: global
+
+Gladius.Registry.register_local(name, spec)    :: :ok
+Gladius.Registry.unregister_local(name)        :: :ok
+Gladius.Registry.clear_local()                 :: :ok
+```
+
+`fetch!/1` checks process-local overlay first, then global ETS.
+
+### `Gladius.Coercions` API
+
+```elixir
+Gladius.Coercions.register({source, target}, fun) :: :ok
+Gladius.Coercions.registered()                    :: %{{atom, atom} => function()}
+Gladius.Coercions.lookup(source, target)           :: function()
 ```
 
 ### Behavioural guarantees
 
-1. **`conform/2` is the single entry point.** `valid?/2` calls it and discards the value. `explain/2` calls it and formats the errors.
-
-2. **Specs are plain structs.** Store in module attributes, pass to functions, compose freely. No hidden state, no registration required unless you use `ref/1`.
-
-3. **`all_of/1` pipelines.** Each spec's shaped output is the next spec's input. Coercions in position 0 transform the value for subsequent specs.
-
-4. **`ref/1` is lazy.** Resolved at `conform/2` call time. Use for forward references and circular schemas. Must be registered before `conform/2` is called (not before the spec is built).
-
-5. **Schema errors accumulate.** `schema/1`, `open_schema/1`, `list_of/1`, and `__coerce_and_check_args__` never short-circuit — all failures are returned at once.
-
-6. **`defspec`/`defschema` with `type: true` requires evaluable spec expressions.** `Code.eval_quoted` runs at macro expansion time with the caller's `Macro.Env`. Spec expressions must be evaluable with the caller's imports. Variables from the surrounding runtime scope are not available.
-
-7. **`signature` is prod-safe.** `Mix.env()` is checked at macro expansion time. In `:prod`, `signature/1` is a no-op and `def` delegates directly to `Kernel.def`. Never guard signature calls with `Mix.env()` yourself.
-
-8. **Coercion registry is global and permanent.** `Gladius.Coercions.register/2` uses `:persistent_term`. There is no `unregister`. Call once at startup; never in tests or hot paths.
-
-9. **Process-local registry for test isolation.** Use `register_local/2` + `clear_local/0` in `on_exit`. `clear/0` clears the global ETS table — safe only in synchronous (non-async) test setup.
-
-10. **`gen/1` raises in `:prod`.** Keep generator calls in `:dev`/`:test` code. For conditional use, guard with `if Mix.env() != :prod`.
+1. `conform/2` is the single entry point. `valid?/2` and `explain/2` call it internally.
+2. Specs are plain structs — store in variables, pass to functions, compose freely.
+3. `all_of/1` pipelines shaped values through each spec in order.
+4. `ref/1` is lazy — resolved at `conform/2` call time, not at spec build time.
+5. Schema errors accumulate — `schema/1`, `open_schema/1`, `list_of/1` never short-circuit.
+6. `default/2` fallbacks are never re-validated — injected as-is when a key is absent.
+7. `transform/2` never runs on invalid data and never crashes the caller — exceptions become `%Error{predicate: :transform}`.
+8. `conform/2` accepts structs transparently — `Map.from_struct/1` is applied automatically. Use `conform_struct/2` to re-wrap the output.
+9. `defschema struct: true` — struct fields are inferred from schema keys at compile time via `Code.eval_quoted`.
+10. `signature` is prod-safe — compiles away entirely in `:prod`.
+11. Coercion registry is global and permanent — `Gladius.Coercions.register/2` uses `:persistent_term`. Call once at startup.
+12. `gen/1` raises in `:prod`.

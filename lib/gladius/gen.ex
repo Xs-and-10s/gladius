@@ -68,6 +68,8 @@ defmodule Gladius.Gen do
   """
   @spec gen(Gladius.conformable()) :: term()
   @doc false
+  def gen(%Gladius.Transform{spec: inner_spec}), do: gen(inner_spec)
+  def gen(%Gladius.Default{spec: inner_spec}), do: gen(inner_spec)
   def gen(%Spec{generator: g}) when not is_nil(g), do: g
 
   def gen(%Spec{type: :any}),     do: StreamData.one_of([
